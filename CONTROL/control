@@ -1,0 +1,5 @@
+Description: StreamProxyCockpit
+Maintainer: xcentaurix
+Package: enigma2-plugin-systemplugins-streamproxycockpit
+Architecture: all
+Depends: python3-pycryptodome

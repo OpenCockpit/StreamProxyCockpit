@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--suppress XmlUnboundNsPrefix -->
+<setupxml>
+	<setup key="streamproxycockpit" title="Setup">
+		<item text="Playback (servicemp3)" description="Register with servicemp3: the channels of the TV plugins (Pluto TV, Rakuten TV, Samsung TV Plus) are played through the stream proxy. Switched off, they can't be played.">config.plugins.streamproxycockpit.playback</item>
+		<item text="Recording (servicemp3record)" description="Register with servicemp3record: the channels of the TV plugins are recorded through the stream proxy. Switched off, they can't be recorded.">config.plugins.streamproxycockpit.recording</item>
+		<item level="2" text="Log level" description="Select debug log level.">config.plugins.streamproxycockpit.debug_log_level</item>
+	</setup>
+</setupxml>
