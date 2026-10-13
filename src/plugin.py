@@ -29,7 +29,7 @@ def Plugins(**__kwargs):
         ),
         PluginDescriptor(
             name=PLUGIN + " - " + _("Setup"),
-            description=_("Register the stream proxy with servicemp3 and servicemp3record"),
+            description=_("Settings of the stream proxy"),
             icon="plugin.png",
             where=PluginDescriptor.WHERE_PLUGINMENU,
             fnc=openSettings

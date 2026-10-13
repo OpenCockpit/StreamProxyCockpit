@@ -25,7 +25,6 @@
 
 import re
 
-from Components.config import config
 from enigma import eServiceReference
 from Navigation import Navigation
 
@@ -71,27 +70,21 @@ def registerChannel(scheme, channel_id, master_url="", url_refresher=None, heade
     return address
 
 
-def _applyRegistration(*_args):
-    """Register the service extensions with Enigma2, or take them out again, as the settings say.
+def _applyRegistration():
+    """Register the service extensions with Enigma2 (once there is a provider).
 
     playServiceExtension is what makes eServiceMP3 play the channels of the providers (through the proxy),
-    recordServiceExtension what makes eServiceMP3Record record them. Called when a provider registers and whenever
-    one of the two settings changes, so the settings take effect at once."""
+    recordServiceExtension what makes eServiceMP3Record record them. They are always installed: whether a provider's
+    channels go through the proxy is decided by the provider itself (a setting of its own, or never optional like
+    PlutoTV), by what its bouquet holds - the lazy address "<scheme>%3a//<channel id>" or the address of the stream.
+    A lazy address left over in a bouquet is resolved either way."""
     if not _providers:
         return
-    for setting, extensions, extension in ((config.plugins.streamproxycockpit.playback, "playServiceExtensions", playServiceExtension),
-                                           (config.plugins.streamproxycockpit.recording, "recordServiceExtensions", recordServiceExtension)):
+    for extensions, extension in (("playServiceExtensions", playServiceExtension),
+                                  ("recordServiceExtensions", recordServiceExtension)):
         current = getattr(Navigation, extensions, None)
-        if current is None:
-            continue
-        if setting.value and extension not in current:
+        if current is not None and extension not in current:
             current.append(extension)
-        elif not setting.value and extension in current:
-            current.remove(extension)
-
-
-config.plugins.streamproxycockpit.playback.addNotifier(_applyRegistration, initial_call=False)
-config.plugins.streamproxycockpit.recording.addNotifier(_applyRegistration, initial_call=False)
 
 
 def channelId(sref):

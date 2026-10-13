@@ -176,51 +176,59 @@ def _mark_idr_delimiters(ts: bytes) -> bytes:
     The type is changed in place (the NAL keeps its size). An IDR frame consists of I slices only, so 'I only' is
     true for it; every other frame keeps 'any slice type'. Non-H.264 video is left alone.
     """
+    # Only the first packet of each video PES packet (one per frame) is looked at, found with bytes.find at C speed.
+    # A loop over every packet of the segment holds the GIL for a long time on the box and slows the main thread.
+    vpid = _first_video_pid(ts)
+    if vpid is None:
+        return ts
     buf = bytearray(ts)
-    vpid = None
-    aud_pos = None            # position of the delimiter byte of the access unit being looked at, None if none
-    au_data = bytearray()     # payload bytes of that access unit so far
-    for off in range(0, len(buf) - 187, 188):
-        if buf[off] != 0x47:
+    start_marker = bytes((0x47, 0x40 | (vpid >> 8), vpid & 0xFF))   # sync byte, payload unit start, the video pid
+    count = len(buf)
+    pos = buf.find(start_marker)
+    while pos >= 0:
+        if pos % 188:   # the marker bytes happened to appear inside a packet
+            pos = buf.find(start_marker, pos + 1)
             continue
-        afc = (buf[off + 3] >> 4) & 3
-        if not afc & 1:
-            continue
-        pid = ((buf[off + 1] & 0x1F) << 8) | buf[off + 2]
-        pl = off + 4 + (1 + buf[off + 4] if afc & 2 else 0)
-        if pl >= off + 188:
-            continue
-        if buf[off + 1] & 0x40:   # start of a PES packet
-            if buf[pl:pl + 3] != b'\x00\x00\x01':
-                continue
-            if vpid is None and 0xE0 <= buf[pl + 3] <= 0xEF:
-                vpid = pid
-            if pid != vpid:
-                continue
-            aud_pos = None
+        afc = (buf[pos + 3] >> 4) & 3
+        pl = pos + 4 + (1 + buf[pos + 4] if afc & 2 else 0)
+        if afc & 1 and pl + 9 < pos + 188 and buf[pl:pl + 3] == b'\x00\x00\x01':
             es = pl + 9 + buf[pl + 8]   # start of the elementary stream data
             if buf[es:es + 4] == b'\x00\x00\x00\x01':
                 nal = es + 4
             elif buf[es:es + 3] == b'\x00\x00\x01':
                 nal = es + 3
             else:
-                continue
-            if nal + 2 > off + 188 or buf[nal] & 0x1F != 9 or buf[nal + 1] != _AUD_ALL_TYPES:
-                continue
-            aud_pos = nal + 1
-            au_data = bytearray(buf[nal + 2:off + 188])
-        elif pid == vpid and aud_pos is not None:
-            au_data += buf[pl:off + 188]
-        else:
-            continue
-        if aud_pos is not None:
-            nal_type = _find_slice_type(au_data, 0)
-            if nal_type == 5:
-                buf[aud_pos] = _AUD_I_ONLY
-                aud_pos = None
-            elif nal_type == 1 or len(au_data) > _AUD_SCAN_LIMIT:
-                aud_pos = None
+                nal = 0
+            if nal and nal + 2 <= pos + 188 and buf[nal] & 0x1F == 9 and buf[nal + 1] == _AUD_ALL_TYPES:
+                # the first slice NAL of the access unit decides, it follows within a packet or two
+                au_data = bytearray(buf[nal + 2:pos + 188])
+                nal_type = _find_slice_type(au_data, 0)
+                nxt = pos + 188
+                while not nal_type and len(au_data) <= _AUD_SCAN_LIMIT and nxt + 188 <= count:
+                    if buf[nxt] == 0x47 and ((buf[nxt + 1] & 0x1F) << 8 | buf[nxt + 2]) == vpid:
+                        if buf[nxt + 1] & 0x40:   # the next access unit already
+                            break
+                        afc2 = (buf[nxt + 3] >> 4) & 3
+                        if afc2 & 1:
+                            au_data += buf[nxt + 4 + (1 + buf[nxt + 4] if afc2 & 2 else 0):nxt + 188]
+                            nal_type = _find_slice_type(au_data, 0)
+                    nxt += 188
+                if nal_type == 5:
+                    buf[nal + 1] = _AUD_I_ONLY
+        pos = buf.find(start_marker, pos + 188)
     return bytes(buf)
+
+
+def _first_video_pid(ts: bytes) -> 'int | None':
+    """The pid of the first video PES packet (stream id 0xE0-0xEF) within the first 400 packets of *ts*."""
+    for off in range(0, min(len(ts) - 187, 188 * 400), 188):
+        if ts[off] != 0x47 or not ts[off + 1] & 0x40:
+            continue
+        afc = (ts[off + 3] >> 4) & 3
+        pl = off + 4 + (1 + ts[off + 4] if afc & 2 else 0)
+        if afc & 1 and pl + 4 <= off + 188 and ts[pl:pl + 3] == b'\x00\x00\x01' and 0xE0 <= ts[pl + 3] <= 0xEF:
+            return ((ts[off + 1] & 0x1F) << 8) | ts[off + 2]
+    return None
 
 
 # ── The per-channel pipeline ──────────────────────────────────────────────────
@@ -247,6 +255,7 @@ class _MuxedChannel:
         self._expected = None                         # PTS the next segment should start at
         self._lost = False                            # a segment was lost: treat the next one as a discontinuity
         self._warned_ffmpeg = False
+        self._start_target = 1                        # segments in the ring before the channel counts as ready
         if inherit is not None:
             # replaces a poller that stopped under a recorder: continue its timeline and continuity counters, so the
             # recording stays one continuous file; the first segment is a discontinuity of the source
@@ -396,12 +405,19 @@ class _MuxedChannel:
                     next_seq = segments[0].seq
                     self._lost = True
                 fresh = [s for s in segments if s.seq >= next_seq]
+            if not self.status:
+                # The player is only told about the channel (and given a playlist) when this many segments are ready.
+                # With just the first one in the playlist it plays it, and has nothing left when it reloads the
+                # playlist a target duration (6s for 5.1s segments) after its first request: a hiccup after about 5s.
+                self._start_target = max(1, min(len(fresh), _START_BACK_SEGMENTS))
             for seg in fresh:
                 if self._stop.is_set():
                     return
                 self._handle_segment(seg)
                 next_seq = seg.seq + 1
                 last_progress = time.monotonic()
+            if not self.status and self.ready:
+                self._set_status('ok')   # fewer segments than planned (one was lost): don't wait for more
             if media.endlist and (not segments or next_seq > segments[-1].seq):
                 logger.debug('%s: end of muxed playlist', self.channel_id)
                 return
@@ -475,24 +491,32 @@ class _MuxedChannel:
         return ts
 
     def _handle_segment(self, seg: Segment):
+        t_start = time.monotonic()
         data = self._fetch_segment(seg)
         if data is None:
             logger.debug('%s: segment %s lost', self.channel_id, seg.seq)
             self._lost = True
             return
-        ts = _mark_idr_delimiters(self._normalize(data))
+        t_fetched = time.monotonic()
+        remuxed = self._normalize(data)
+        t_remuxed = time.monotonic()
+        ts = _mark_idr_delimiters(remuxed)
         disc = seg.disc or self._lost
         self._lost = False
         if disc:
             logger.debug('%s: segment %s starts after a discontinuity', self.channel_id, seg.seq)
         out = self._continuize(ts, seg, disc)
         duration = seg.duration if seg.duration > 0 else _DEFAULT_SEG_DURATION
+        t_done = time.monotonic()
         with self.cond:
             self.ready[self._next_seq] = (out, duration)
+            logger.debug('%s: segment %s (cdn %s, %.1fs, %s bytes) ready: fetch %.2fs, remux %.2fs, rewrite %.2fs, %s in the ring',
+                         self.channel_id, self._next_seq, seg.seq, duration, len(out),
+                         t_fetched - t_start, t_remuxed - t_fetched, t_done - t_remuxed, len(self.ready))
             self._next_seq += 1
             while len(self.ready) > _MAX_READY:
                 self.ready.popitem(last=False)
-            if not self.status:
+            if not self.status and len(self.ready) >= self._start_target:
                 self.status = 'ok'
             self.cond.notify_all()
 
@@ -565,13 +589,19 @@ def handle_playlist(handler, channel_id: str):
     if text is None:
         handler._send(404, b'Unknown channel', 'text/plain')
         return
+    seqs = [int(line.rsplit('/', 1)[1].split('.')[0]) for line in text.splitlines() if '/mseg/' in line]
+    logger.debug('%s: playlist offered: segments %s-%s', channel_id, seqs[0] if seqs else '-', seqs[-1] if seqs else '-')
     handler._send(200, text.encode(), 'application/x-mpegURL')
 
 
 def handle_segment(handler, channel_id: str, seq: int):
     channel = get_channel(channel_id)
+    started = time.monotonic()
     item = channel.wait_for(seq, _SEGMENT_WAIT) if channel is not None else None
+    waited = time.monotonic() - started
     if item is None:
+        logger.debug('%s: segment %s requested, not available after %.2fs', channel_id, seq, waited)
         handler._send(404, b'Segment not available', 'text/plain')
         return
+    logger.debug('%s: segment %s requested, served after waiting %.2fs (%s bytes)', channel_id, seq, waited, len(item[1]))
     handler._send(200, item[1], 'video/MP2T')

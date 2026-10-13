@@ -25,7 +25,9 @@ def resolveStream(channel_id, sref):
 StreamProxy.registerProvider("mytv", resolveStream)
 ```
 
-Its bouquet entries use `mytv%3a//<channel id>` as the stream of a 4097 service. When such a service is played or recorded, Enigma2 calls `resolveStream(channel_id, sref)`, which returns the address of the proxy for the channel. `StreamProxy.registerChannel()` starts the proxy, registers the channel and returns that address:
+Its bouquet entries use `mytv%3a//<channel id>` as the stream of a 4097 service. When such a service is played or recorded, Enigma2 calls `resolveStream(channel_id, sref)`, which returns the address of the proxy for the channel. `StreamProxy.registerChannel()` starts the proxy, registers the channel and returns that address.
+
+The service extensions are always installed once a provider has registered. Whether the channels of a provider go through the proxy is the provider's decision, and it is made when it writes its bouquet: the lazy address for a provider that needs the proxy or has it switched on (an own setting "Stream proxy" in PlutoTVCockpit, RakutenTVCockpit and SamsungTVCockpit), otherwise the address of the stream itself, the way it was before the stream proxy existed. A lazy address that is still in a bouquet is resolved either way.
 
 | Argument | Meaning |
 |---|---|
@@ -45,11 +47,9 @@ The setup screen is in the plugin menu (**StreamProxyCockpit - Setup**):
 
 | Setting | Meaning |
 |---|---|
-| **Playback (servicemp3)** | Registers the plugin with servicemp3: the channels of the TV plugins are played through the stream proxy. Switched off, they can't be played |
-| **Recording (servicemp3record)** | Registers the plugin with servicemp3record: the channels of the TV plugins are recorded through the stream proxy. Switched off, they can't be recorded |
 | **Log level** | Debug log level of the proxy (expert setting) |
 
-Both registrations are on by default. A change takes effect at once; no restart is needed. Channels that are already open stay open.
+Whether a TV plugin uses the proxy is set in that plugin: **Stream proxy** in the setup of PlutoTVCockpit, RakutenTVCockpit and SamsungTVCockpit (on by default). The bouquet of each setting is kept (`<bouquet>.tv.proxy`, `<bouquet>.tv.noproxy`), `<bouquet>.tv` is always the one of the current setting: changing it copies the stored bouquet over `<bouquet>.tv`, a bouquet that is not stored yet or is older than the update interval (5 hours) is generated.
 
 ## Installation
 The package `enigma2-plugin-systemplugins-streamproxycockpit` is installed together with the plugins that need it. Restart Enigma2 afterwards.
