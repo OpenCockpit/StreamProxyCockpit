@@ -1377,7 +1377,7 @@ def _ensure_pipeline(channel_id: str, state: '_ChannelState') -> bool:
     if not needs_mux:
         return False
 
-    master_base = state.master_url.split('?')[0].rsplit('/', 1)[0] + '/'
+    master_base = _base_url(text, state.master_url)
     audio_candidates = []
     variant_urls = []
     lines = text.splitlines()
@@ -2918,6 +2918,21 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
+class _FetchedText(str):
+    """The text of a playlist, with the address it was fetched from in .url: after the redirects of the request.
+
+    Relative addresses in a playlist are relative to that one, not to the address that was asked for: the master
+    playlist of a channel can be behind a redirect to another host (Rakuten TV: the playout host redirects to
+    AWS MediaTailor), and its variants are then found there and nowhere on the host of the redirecting address."""
+    url = ''
+
+
+def _base_url(text, requested_url: str) -> str:
+    """The directory address relative addresses in the playlist *text* are relative to (the query string is no
+    part of it): where it was finally fetched from, *requested_url* if that isn't known."""
+    return (getattr(text, 'url', '') or requested_url).split('?')[0].rsplit('/', 1)[0] + '/'
+
+
 def _fetch(url: str, binary: bool = False, timeout: int = 6, tag: str = '', headers: 'dict | None' = None):
     """Fetch *url* and return text or bytes; returns None on any error.
 
@@ -2943,7 +2958,11 @@ def _fetch(url: str, binary: bool = False, timeout: int = 6, tag: str = '', head
     try:
         r = _SESSION.get(url, timeout=timeout, headers=headers)
         r.raise_for_status()
-        return r.content if binary else r.text
+        if binary:
+            return r.content
+        text = _FetchedText(r.text)
+        text.url = r.url
+        return text
     except Exception as exc:
         label = f' [{tag}]' if tag else ''
         logger.debug('fetch error%s %r: %s', label, url, exc)
@@ -3114,7 +3133,7 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             return
 
         # Base directory of the master URL (for resolving relative URIs).
-        master_base = state.master_url.split('?')[0].rsplit('/', 1)[0] + '/'
+        master_base = _base_url(text, state.master_url)
 
         out = []
         variant_urls = []

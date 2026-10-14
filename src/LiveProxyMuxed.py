@@ -43,9 +43,11 @@ from .HLSParser import HLSPlaylist
 from .LiveProxyUnmuxed import PROXY_HOST, PROXY_PORT, _FFMPEG, _FFMPEG_TIMEOUT, _fetch, _first_pts, _patch_continuity, resolved_master_url
 from .RecordingProxyUnmuxed import _PTS_MASK, _rewrite_timeline, _segment_is_disc
 
-_START_BACK_SEGMENTS = 3       # a channel starts this many segments before the live edge (hlsdemux does too)
+_START_BACK_SEGMENTS = 3       # a channel starts at least this many segments before the live edge (hlsdemux does too)
+_START_BACK_SECONDS = 9.0      # ... and at least this much content: three 1s segments are no cushion against a CDN that stalls for 4-7s
 START_TIMEOUT = 25.0          # seconds until the first segment is ready (or the stream turns out to be unusable)
-_PLAYLIST_SEGMENTS = 6         # segments advertised in the served playlist
+_PLAYLIST_SEGMENTS = 6         # segments advertised in the served playlist at least
+_MIN_TARGET = 3                # the shortest target duration advertised: hlsdemux starts three of them before the end
 _MAX_READY = 40                # segments kept per channel; a reader further behind is moved forward
 _IDLE_TIMEOUT = 60.0           # seconds without a request or reader before the poller stops
 _STALL_LIMIT = 90.0            # seconds without a new segment before the poller gives up
@@ -83,6 +85,21 @@ def _variant_urls(text: str, base: str) -> 'list[str]':
             variants.append((bandwidth, urljoin(base, lines[j])))
     variants.sort(key=lambda v: v[0], reverse=True)
     return [url for _bw, url in variants]
+
+
+def _back_count(segments: 'list[Segment]') -> int:
+    """How many of the newest *segments* a channel starts with: enough for _START_BACK_SECONDS of content, and at
+    least _START_BACK_SEGMENTS. Three segments are only three seconds of content if the stream starts with one
+    second segments, and a CDN that stalls for longer leaves the player with nothing to play (a hiccup right after
+    the start). Fewer if the playlist doesn't have that many."""
+    count = 0
+    seconds = 0.0
+    for seg in reversed(segments):
+        count += 1
+        seconds += seg.duration if seg.duration > 0 else _DEFAULT_SEG_DURATION
+        if count >= _START_BACK_SEGMENTS and seconds >= _START_BACK_SECONDS:
+            break
+    return count
 
 
 def _parse_media(text: str, base: str) -> MediaPlaylist:
@@ -312,10 +329,27 @@ class _MuxedChannel:
     def playlist(self) -> 'str | None':
         """The media playlist for live playback: the newest segments, no discontinuity tags."""
         with self.cond:
-            items = list(self.ready.items())[-_PLAYLIST_SEGMENTS:]
-        if not items:
+            ready = list(self.ready.items())
+        if not ready:
             return None
-        target = max(1, math.ceil(max(duration for _seq, (_data, duration) in items)))
+        items = ready[-_PLAYLIST_SEGMENTS:]
+        # Not the longest segment rounded up, but one second less (and three at least): hlsdemux reloads the playlist
+        # once per target duration, plus its own overhead (about 9 ms per reload in the logs). With a target of 6s for
+        # 6s segments it fetched a segment every 6.009s, 0.15% slower than the decoder plays: the buffer ran dry
+        # after about 4 minutes and the audio decoder then dropped frames (tsm fail) at every segment. With a shorter
+        # target it polls faster than segments appear and fetches each as soon as it is there. hlsdemux also starts
+        # three target durations before the end of the playlist, so that is what a start has as a cushion: three
+        # seconds only, with the one second segments some channels start with (the CDN then stalled for 4-7s and the
+        # playback hiccuped right after the start), hence the minimum.
+        target = max(_MIN_TARGET, math.ceil(max(duration for _seq, (_data, duration) in items)) - 1)
+        # offer more than the 6 segments if they are short, so that those three targets are in the playlist
+        total = sum(duration for _seq, (_data, duration) in items)
+        first = len(ready) - len(items)
+        while first > 0 and total < 4 * target:
+            first -= 1
+            total += ready[first][1][1]
+        items = ready[first:]
+        target = max(target, math.ceil(max(duration for _seq, (_data, duration) in items)) - 1)
         out = ['#EXTM3U', '#EXT-X-VERSION:3', f'#EXT-X-TARGETDURATION:{target}', f'#EXT-X-MEDIA-SEQUENCE:{items[0][0]}']
         for seq, (_data, duration) in items:
             out.append(f'#EXTINF:{duration:.3f},')
@@ -354,6 +388,9 @@ class _MuxedChannel:
         text = _fetch(master_url, timeout=_PLAYLIST_TIMEOUT, tag='muxed:master', headers=self._headers()) if master_url else None
         if not text or not text.lstrip().startswith('#EXTM3U'):
             return None
+        # relative addresses are relative to where the playlist was finally fetched from, after the redirects of the
+        # master address (Rakuten TV: playout host -> AWS MediaTailor, whose variants are not on the playout host)
+        master_url = getattr(text, 'url', '') or master_url
         if '#EXT-X-STREAM-INF' not in text:
             return master_url
         variants = _variant_urls(text, master_url)
@@ -397,7 +434,7 @@ class _MuxedChannel:
                 return
             segments = media.segments
             if next_seq is None and segments:
-                next_seq = segments[0].seq if media.endlist else segments[max(0, len(segments) - _START_BACK_SEGMENTS)].seq
+                next_seq = segments[0].seq if media.endlist else segments[max(0, len(segments) - _back_count(segments))].seq
             fresh = []
             if segments:
                 if next_seq < segments[0].seq:
@@ -409,7 +446,7 @@ class _MuxedChannel:
                 # The player is only told about the channel (and given a playlist) when this many segments are ready.
                 # With just the first one in the playlist it plays it, and has nothing left when it reloads the
                 # playlist a target duration (6s for 5.1s segments) after its first request: a hiccup after about 5s.
-                self._start_target = max(1, min(len(fresh), _START_BACK_SEGMENTS))
+                self._start_target = max(1, min(len(fresh), _back_count(segments)))
             for seg in fresh:
                 if self._stop.is_set():
                     return
@@ -430,7 +467,7 @@ class _MuxedChannel:
                 if segments and segments[-1].seq < next_seq and now - last_progress > _RESYNC_AFTER:
                     # the media sequence went back (a new stitcher session or ad break numbers from a lower base):
                     # every segment of the playlist is "old" for us and none would ever be fetched again
-                    next_seq = segments[max(0, len(segments) - _START_BACK_SEGMENTS)].seq
+                    next_seq = segments[max(0, len(segments) - _back_count(segments))].seq
                     self._lost = True
                     last_progress = now
                     logger.debug('%s: media sequence went back to %s..%s, following it from %s',
