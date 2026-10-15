@@ -1,7 +1,7 @@
 # Copyright (C) 2026 by xcentaurix
 # License: GNU General Public License v3.0
 #
-#   RecordingProxyMuxed - serves a single, container-continuous MPEG-TS stream for recording a Pluto TV channel
+#   RecordingProxyMuxed - serves a single, container-continuous MPEG-TS stream for recording a channel
 #   that is already muxed (video and audio in the same transport stream), the RecordingProxyUnmuxed counterpart for a
 #   channel LiveProxyUnmuxed doesn't have to mux itself.
 #

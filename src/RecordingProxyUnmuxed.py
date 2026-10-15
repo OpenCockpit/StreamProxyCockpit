@@ -2,7 +2,7 @@
 # License: GNU General Public License v3.0
 #
 #   RecordingProxyUnmuxed - serves a single, container-continuous MPEG-TS stream for
-#   recording a Pluto TV channel, instead of the segment-chunked HLS delivery
+#   recording a channel, instead of the segment-chunked HLS delivery
 #   LiveProxyUnmuxed uses for live playback.
 #
 #   LiveProxyUnmuxed produces a correctly muxed (audio/video-paired) TS chunk per
@@ -184,7 +184,7 @@ class RecordingSession:
         self._seg_ticks = int(state.seg_duration * 90000)
         self._feeder_stop = threading.Event()
         self._feeder_thread = threading.Thread(target=self._feed_loop, daemon=True,
-                                               name=f'PlutoRecFeeder-{channel_id[:8]}')
+                                               name=f'RecFeeder-{channel_id[:8]}')
         self._feeder_thread.start()
 
     def _output(self, muxed: bytes) -> None:
@@ -346,7 +346,7 @@ def handle_recording(handler, channel_id):
         handler.end_headers()
         return
 
-    # Counted for the whole connection so PlutoTVRequest.playServiceExtension does not close the channel
+    # Counted for the whole connection so StreamProxy.playServiceExtension does not close the channel
     # under a recorder that is not a record timer (e.g. TimeshiftCockpit) when the live slot moves on.
     with recording_client(channel_id):
         # Recording connects straight here, never through /master or /pl, so

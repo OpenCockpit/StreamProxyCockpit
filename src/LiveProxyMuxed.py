@@ -1,7 +1,7 @@
 # Copyright (C) 2026 by xcentaurix
 # License: GNU General Public License v3.0
 #
-#   LiveProxyMuxed - the LiveProxyUnmuxed counterpart for Pluto TV streams that are already muxed (video and audio in
+#   LiveProxyMuxed - the LiveProxyUnmuxed counterpart for streams that are already muxed (video and audio in
 #   the same transport stream, no #EXT-X-MEDIA:TYPE=AUDIO rendition).
 #
 #   LiveProxyUnmuxed only has to touch a stream whose audio is a separate rendition; a muxed stream used to be answered
@@ -428,7 +428,7 @@ class _MuxedChannel:
         if not text or not text.lstrip().startswith('#EXTM3U'):
             return None
         # relative addresses are relative to where the playlist was finally fetched from, after the redirects of the
-        # master address (Rakuten TV: playout host -> AWS MediaTailor, whose variants are not on the playout host)
+        # master address (a playout host that redirects to an ad-insertion service whose variants are not on the playout host)
         master_url = getattr(text, 'url', '') or master_url
         if '#EXT-X-STREAM-INF' not in text:
             return master_url
@@ -504,7 +504,7 @@ class _MuxedChannel:
                     logger.debug('%s: nothing new in the playlist for %ss: seq %s..%s, waiting for %s',
                                  self.channel_id, int(now - last_progress), segments[0].seq, segments[-1].seq, next_seq)
                 if segments and segments[-1].seq < next_seq and now - last_progress > _RESYNC_AFTER:
-                    # the media sequence went back (a new stitcher session or ad break numbers from a lower base):
+                    # the media sequence went back (a new stream session or ad break numbers from a lower base):
                     # every segment of the playlist is "old" for us and none would ever be fetched again
                     next_seq = segments[max(0, len(segments) - _start_count(segments))].seq
                     self._lost = True

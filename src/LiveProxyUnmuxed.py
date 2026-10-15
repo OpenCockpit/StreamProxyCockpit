@@ -1,7 +1,7 @@
 # Copyright (C) 2026 by xcentaurix
 # License: GNU General Public License v3.0
 #
-#   LiveProxyUnmuxed – local HLS proxy that converts demuxed streams (Pluto TV)
+#   LiveProxyUnmuxed – local HLS proxy that converts demuxed streams
 #   (separate video-TS + audio-TS delivered via EXT-X-MEDIA:TYPE=AUDIO) into
 #   single muxed TS segments that Enigma2's DVB hardware pipeline handles.
 
@@ -38,7 +38,7 @@ _SEQ_REPROCESS_WINDOW = 10     # how far behind the current base seq the video-p
 #                              # (state._audio_disc_seqs_seen, state._audio_appended_seqs)
 #                              # forget a seq, letting it be treated as brand new if it
 #                              # reappears. These must forget seqs on this same short horizon,
-#                              # not _MAX_SEG_CACHE's much wider one: some Pluto channels serve
+#                              # not _MAX_SEG_CACHE's much wider one: some channels serve
 #                              # a stitched ad-pod/filler loop whose playlist media-sequence
 #                              # numbers wrap back down and repeat rather than growing
 #                              # monotonically forever, and once a seq reappears its
@@ -70,6 +70,11 @@ _PREFETCH_LEAD_SEGMENTS = 20   # how far ahead of the last segment Enigma2 actua
 #                              # ring of the near-term content it actually needs (evicted by
 #                              # the size cap in favor of far-future entries) long before
 #                              # video gets anywhere near using them.
+_VOD_KEEP_BEHIND_SEGMENTS = 24  # VOD only: already-played segments kept behind the last one Enigma2
+#                              # requested (~2 min), enough for a retried request or a short rewind.
+#                              # A VOD asset is not a ring like a live channel, so without this every
+#                              # produced segment (~1.5 MB each) stays in RAM up to _MAX_SEG_CACHE -
+#                              # about 300 MB, on a receiver with 1 GB and no swap.
 _MAX_UNCONSUMED_AUDIO_EPOCHS = 8  # closed audio epochs kept regardless of age/count while
 #                              # video hasn't consumed them yet - see _prune_audio_bufs
 _AUDIO_BUFFER_RETAIN_EPOCHS = 1  # closed _RenditionBuffer epochs kept, beyond the current
@@ -396,7 +401,7 @@ def _scan_ts_index(ts_bytes: bytes) -> 'tuple[list[tuple[int, int]], bytes | Non
             continue
         if pending_pat is not None and pid != 0x1FFF:
             # First non-PAT, non-null packet after a PAT is assumed to be
-            # its PMT - true for every Pluto segment observed (a PAT is
+            # its PMT - true for every segment observed (a PAT is
             # immediately followed by its PMT, standard for a
             # single-program TS).
             pat_pmt = pending_pat + bytes(ts_bytes[off:off + 188])
@@ -778,7 +783,7 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
 class _ChannelState:
     """Holds state accumulated while proxying one live channel."""
 
-    __slots__ = ('master_url', 'url_refresher', '_headers', 'refresh_on_failure', '_master_lock',
+    __slots__ = ('master_url', 'url_refresher', '_headers', 'refresh_on_failure', 'session_param', '_master_lock',
                  'audio_url', 'variant_urls',
                  'seg_duration', 'last_access', 'audio_format',
                  '_video_buf', '_video_cursor_pts', '_audio_bufs',
@@ -807,6 +812,7 @@ class _ChannelState:
         self.url_refresher = None        # callable() -> fresh master URL; called from a worker thread (it may block)
         self._headers = None             # extra HTTP headers every request of this channel carries: a dict, a callable
         #                                # returning one (evaluated on the worker that needs it, so it may block), or None
+        self.session_param = 'sid'       # query parameter of the master URL that carries the id of the stream session
         self.refresh_on_failure = False  # call url_refresher when the master playlist can't be fetched, not just
         #                                # for an empty JWT
         self._master_lock = threading.Lock()
@@ -1145,7 +1151,7 @@ class _ChannelState:
 
     def discard_stale_stream(self):
         """Drop everything served/buffered from before the pre-fetch threads stopped (or from a
-        previous stitcher session), so a restarted pipeline does not glue fresh data onto stale
+        previous stream session), so a restarted pipeline does not glue fresh data onto stale
         data. Shared by register_channel and reopen()."""
         with self._lock:
             self._vod_complete = False
@@ -1173,7 +1179,7 @@ class _ChannelState:
             # _append_audio dedups by CDN seq via these two sets so
             # the sync pre-population pass and the background
             # prefetch thread (which independently parse the same
-            # playlist) don't double-append the same seq. Pluto's
+            # playlist) don't double-append the same seq. A
             # live playlist has a sliding window of ~15-30s, so a
             # short interruption (e.g. briefly watching a recording)
             # can still show the *same* low seqs this channel already
@@ -1205,8 +1211,43 @@ class _ChannelState:
             self._audio_prepopulated = False
         return was_closed
 
-    def close(self):
-        """Signal all pre-fetch threads to stop and wait for them to exit.
+    def evict_played(self, keep_behind: int):
+        """VOD only: drop the segments more than *keep_behind* behind the last one Enigma2 requested.
+
+        Called from _handle_segment after the request is recorded. Live channels are rings and never need this."""
+        with self._lock:
+            floor = self._last_requested_seq - keep_behind
+            while self._ready_segs:
+                seq = next(iter(self._ready_segs))
+                if seq >= floor:
+                    break
+                del self._ready_segs[seq]
+                self._window_meta.pop(seq, None)
+                self._window_delta.pop(seq, None)
+                self._shift_cache.pop(seq, None)
+
+    def release(self):
+        """Drop everything this channel holds in RAM. Only for a closed channel nobody will read again (a VOD
+        whose player has left); the state itself stays registered until the idle reaper removes it."""
+        self.discard_stale_stream()
+        with self._lock:
+            self._last_segment_out = None
+            self._last_playlist_out.clear()
+
+    def close_and_release(self, channel_id: str):
+        """close(), then release() once the pre-fetch threads are really gone (they own the buffers until then)."""
+        stopped = self.close()
+        deadline = time.monotonic() + 20   # a thread can be mid-ffmpeg or mid-fetch; give it time to notice the stop
+        while not stopped and time.monotonic() < deadline:
+            time.sleep(0.5)
+            stopped = not any(t is not None and t.is_alive()
+                              for t in (self._audio_prefetch_thread, self._video_prefetch_thread))
+        if stopped:
+            self.release()
+            logger.debug('%s: closed, buffers released', channel_id)
+
+    def close(self) -> bool:
+        """Signal all pre-fetch threads to stop and wait for them to exit. Returns True if they all did.
 
         A thread only notices _audio_prefetch_stop/_video_prefetch_stop
         between blocking calls - one stuck in a slow or hanging _fetch()
@@ -1222,13 +1263,16 @@ class _ChannelState:
         """
         self._audio_prefetch_stop.set()
         self._video_prefetch_stop.set()
+        stopped = True
         for t in (self._audio_prefetch_thread, self._video_prefetch_thread):
             if t is not None and t.is_alive():
                 t.join(timeout=5)
                 if t.is_alive():
+                    stopped = False
                     logger.debug('%s: did not stop within 5s of close() - still running, '
                                  'likely blocked in a slow/hanging fetch; left as a detached '
                                  'daemon thread rather than blocking close() further', t.name)
+        return stopped
 
     def start_audio_prefetch_if_needed(self, channel_id: str):
         """Idempotently start the audio pre-fetch thread, if not already running.
@@ -1336,8 +1380,8 @@ def _ensure_pipeline(channel_id: str, state: '_ChannelState') -> bool:
     re-fetch+overwrite below, silently swapping state.audio_url/
     state.variant_urls for freshly-signed CDN URLs out from under an
     already-running live viewer's prefetch threads mid-stream - the same
-    class of bug fixed in PlutoTVRequest.buildStreamURL (see
-    active_channel_url), just here instead: this function only exists
+    class of bug a provider avoids by asking active_channel_url
+    first, just here instead: this function only exists
     because RecordingProxyUnmuxed.handle_recording() calls it on every
     connection, live playback never goes through it at all.
 
@@ -1586,7 +1630,8 @@ def _slice_audio_for_window(state: '_ChannelState', epoch: int, start_pts: int, 
                              channel_id, chunk_seq, epoch, start_pts, end_pts, wait_secs,
                              is_disc_window, snapshot)
             return None, None, False
-        time.sleep(0.1)
+        if state._audio_prefetch_stop.wait(timeout=0.1):
+            return None, None, False   # channel closed: the audio will never arrive, don't hold close() up
 
 
 def _resolve_late_audio_window(channel_id: str, state: '_ChannelState', chunk_seq: int,
@@ -1839,7 +1884,7 @@ def _mux_whole_video_segment(channel_id: str, state: '_ChannelState', epoch: int
     transmitted before the B-frames that display earlier than it, so a
     video segment's own pts_offsets (as scanned by _scan_ts_index, in
     transmission order) can be locally out of order. Confirmed on real
-    Pluto content via a diagnostic in _RenditionBuffer.append(): up to
+    FAST-channel content via a diagnostic in _RenditionBuffer.append(): up to
     roughly half the PTS entries in a single segment out of order, on both
     live and VOD channels equally. bisect() on unsorted input doesn't
     raise - it silently returns a technically-computed but wrong index,
@@ -2008,7 +2053,7 @@ def _audio_prefetch_loop(channel_id: str, state: '_ChannelState'):
         # Diagnostic only - see HLSPlaylist.ad_markers's docstring. Logged
         # unconditionally when present (not deduped across polls) since
         # this is meant to be pulled once a real capture confirms whether
-        # Pluto sends any of these at all, not left running long-term.
+        # a provider sends any of these at all, not left running long-term.
         ad_markers = HLSPlaylist.ad_markers(atext)
         if ad_markers:
             logger.debug('%s: audio playlist ad markers: %s', channel_id, ad_markers)
@@ -2331,7 +2376,7 @@ def _video_prefetch_loop(channel_id: str, state: '_ChannelState',
         # Diagnostic only - see HLSPlaylist.ad_markers's docstring. Logged
         # unconditionally when present (not deduped across polls) since
         # this is meant to be pulled once a real capture confirms whether
-        # Pluto sends any of these at all, not left running long-term.
+        # a provider sends any of these at all, not left running long-term.
         ad_markers = HLSPlaylist.ad_markers(vtext)
         if ad_markers:
             logger.debug('%s: video playlist ad markers: %s', channel_id, ad_markers)
@@ -2685,8 +2730,7 @@ def active_channel_url(channel_id: str) -> 'str | None':
     """Return the local proxy master-playlist URL for *channel_id* if it
     already has a *running* session registered, or None otherwise.
 
-    Lets a caller about to mint a fresh stream URL (see
-    PlutoTVRequest.buildStreamURL) check first whether the channel is
+    Lets a provider about to mint a fresh stream URL check first whether the channel is
     already running - under some other pool slot's session - so it can
     reuse that instead of silently repointing an already-live channel at
     a different device identity's session (see buildStreamURL's
@@ -2707,21 +2751,18 @@ def active_channel_url(channel_id: str) -> 'str | None':
     return f'http://{PROXY_HOST}:{PROXY_PORT}/auto/{channel_id}.m3u8'
 
 
-def _stitcher_sid(master_url: str) -> 'str | None':
-    """Extract Pluto's stitcher session id (?sid=...) from a master URL.
+def _session_id(master_url: str, param: str = 'sid') -> 'str | None':
+    """Extract the id of the stream session (the query parameter *param*, ?sid=... by default) from a master URL.
 
-    Identifies which real Pluto stitching session a master_url belongs to,
-    as opposed to which JWT/device-slot it was minted with (those rotate
-    independently of the session - see register_channel's sid-comparison
-    use). Returns None if absent so a URL shape that never carries sid
-    (e.g. no live stitcher session at all) compares unequal to itself only
-    when actually different strings, never spuriously "changed".
+    Identifies which real session of the stream server a master_url belongs to, as opposed to which token/device
+    identity it was minted with (those rotate independently of the session - see register_channel's use of it).
+    Returns None if absent, so a URL that never carries one is never taken for a session that "changed".
     """
-    return (parse_qs(urlparse(master_url).query).get('sid') or [None])[0]
+    return (parse_qs(urlparse(master_url).query).get(param) or [None])[0]
 
 
 def register_channel(channel_id: str, real_master_url: str, url_refresher=None, headers=None,
-                     refresh_on_failure: bool = False) -> str:
+                     refresh_on_failure: bool = False, session_param: str = 'sid') -> str:
     """Register a channel and return the local proxy URL for its master playlist.
 
     *url_refresher*, when supplied, is stored on the channel state and called
@@ -2739,6 +2780,11 @@ def register_channel(channel_id: str, real_master_url: str, url_refresher=None, 
 
     *refresh_on_failure*: also call the *url_refresher* when the master playlist can't be fetched, not just for
     an empty JWT (an address that expires, a redirect that ends up somewhere else).
+
+    *session_param*: the query parameter of the master address that carries the id of the stream session ('sid').
+    A registration of a running channel whose address has another session id starts the channel's served data
+    afresh, as the new session numbers its segments from a different base. A provider whose addresses carry no
+    session id is not affected.
 
     Idempotent for an already-registered channel_id: reuses its existing
     state (pre-fetch threads, audio ring, muxed-segment cache) and just
@@ -2769,8 +2815,9 @@ def register_channel(channel_id: str, real_master_url: str, url_refresher=None, 
     with _state_lock:
         existing = _channels.get(channel_id)
         if existing is not None:
-            old_sid = _stitcher_sid(existing.master_url)
-            new_sid = _stitcher_sid(real_master_url)
+            existing.session_param = session_param
+            old_sid = _session_id(existing.master_url, session_param)
+            new_sid = _session_id(real_master_url, session_param)
             if real_master_url:
                 existing.master_url = real_master_url
             if url_refresher is not None:
@@ -2778,12 +2825,12 @@ def register_channel(channel_id: str, real_master_url: str, url_refresher=None, 
                 existing.refresh_on_failure = refresh_on_failure
             if headers is not None:
                 existing.headers = headers
-            # A new Pluto stitcher session (fresh sid) starts its own,
+            # A new stream session (fresh session id) starts its own,
             # unrelated media-sequence numbering from a low base - see
-            # buildStreamURL's own doc for when this call gets a genuinely
+            # active_channel_url for when this call gets a genuinely
             # new session (active_channel_url returned None: the previous
             # session's threads had actually stopped) versus the same
-            # session simply being re-resolved (sid unchanged, e.g. a
+            # session simply being re-resolved (session id unchanged, e.g. a
             # recording re-resolving its sref) that this whole idempotent-
             # reuse path exists to protect. This clears the *served* cache
             # only (_ready_segs/_window_meta/_provisional_segs) - not
@@ -2812,8 +2859,8 @@ def register_channel(channel_id: str, real_master_url: str, url_refresher=None, 
             # Checked *before* clearing the stop Events just below, so this
             # reflects whether the pipeline had actually died (close_channel()
             # ran to completion) since this channel was last used - not just
-            # whether the session token changed. A same-session re-zap (sid
-            # unchanged) still tore down and is restarting the prefetch
+            # whether the session token changed. A same-session re-zap (session
+            # id unchanged) still tore down and is restarting the prefetch
             # threads from scratch here, which will resume fetching from
             # whatever the CDN's live edge is *now* - real time kept moving
             # the whole time this channel sat unwatched, so the entries
@@ -2856,6 +2903,7 @@ def register_channel(channel_id: str, real_master_url: str, url_refresher=None, 
             state = _ChannelState(real_master_url)
             state.url_refresher = url_refresher
             state.refresh_on_failure = refresh_on_failure
+            state.session_param = session_param
             state.headers = headers
             _channels[channel_id] = state
     return f'http://{PROXY_HOST}:{PROXY_PORT}/auto/{channel_id}.m3u8'
@@ -2878,7 +2926,12 @@ def close_channel(channel_id: str) -> bool:
         state = _channels.get(channel_id)
     if state is None:
         return muxed_closed
-    threading.Thread(target=state.close, daemon=True).start()
+    if channel_id.startswith('vod'):
+        # a VOD channel is never read again once its player has left, so free its (large) buffers at once
+        # instead of holding them until the idle reaper removes the entry
+        threading.Thread(target=state.close_and_release, args=(channel_id,), daemon=True).start()
+    else:
+        threading.Thread(target=state.close, daemon=True).start()
     return True
 
 
@@ -2922,8 +2975,8 @@ class _FetchedText(str):
     """The text of a playlist, with the address it was fetched from in .url: after the redirects of the request.
 
     Relative addresses in a playlist are relative to that one, not to the address that was asked for: the master
-    playlist of a channel can be behind a redirect to another host (Rakuten TV: the playout host redirects to
-    AWS MediaTailor), and its variants are then found there and nowhere on the host of the redirecting address."""
+    playlist of a channel can be behind a redirect to another host (a playout host that redirects to
+    an ad-insertion service), and its variants are then found there and nowhere on the host of the redirecting address."""
     url = ''
 
 
@@ -3093,8 +3146,8 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             if text:
                 break
             # Covers a transient failure unrelated to the cold-slot/empty-JWT
-            # case above (observed in production: Pluto's own stitcher
-            # returning a bare 500 for one channel, gone on the very next
+            # case above (observed in production: a provider's own stitching
+            # server returning a bare 500 for one channel, gone on the very next
             # attempt) - _fetch() only reports success/failure, not a status
             # code, so this just retries the same URL rather than branching
             # on the failure reason.
@@ -3480,6 +3533,8 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             return
 
         state.record_segment_request(seq)
+        if channel_id.startswith('vod'):
+            state.evict_played(_VOD_KEEP_BEHIND_SEGMENTS)
 
         # Fast path: serve from the pre-muxed cache populated by the video
         # prefetch thread.  In steady state the chunk is already ready when

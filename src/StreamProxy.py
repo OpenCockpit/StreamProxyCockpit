@@ -2,15 +2,15 @@
 # License: GNU General Public License v3.0
 #
 #   StreamProxy - the integration of the stream proxy (LiveProxyUnmuxed, RecordingProxyUnmuxed, ...) with Enigma2 for the
-#   plugins that provide streams (PlutoTVCockpit, RakutenTVCockpit, SamsungTVCockpit, ...).
+#   plugins that provide streams (any plugin that registers itself as a provider).
 #
 #   A provider plugin registers itself under a scheme:
 #
-#       StreamProxy.registerProvider("pluto", resolve)
+#       StreamProxy.registerProvider("mytv", resolve)
 #
 #   Its bouquet entries then carry a lazy address "<scheme>%3a//<channel id>" as the stream of a 4097 service:
 #
-#       4097:0:1:<sid>:<tsid>:...:pluto%3a//<channel id>:<name>
+#       4097:0:1:<sid>:<tsid>:...:mytv%3a//<channel id>:<name>
 #
 #   so nothing has to be fetched while the bouquet is written, and the real address is looked up when the channel is
 #   played or recorded. Enigma2 calls the service extensions below for every playService() and recordService();
@@ -53,18 +53,20 @@ def registerProvider(scheme, resolve):
     _applyRegistration()
 
 
-def registerChannel(scheme, channel_id, master_url="", url_refresher=None, headers=None, refresh_on_failure=False):
+def registerChannel(scheme, channel_id, master_url="", url_refresher=None, headers=None, refresh_on_failure=False,
+                    session_param="sid"):
     """Start the proxy if it isn't running, register the channel with it and return the address Enigma2 plays it
     from (/auto/<id>.m3u8, plus the header suffix if the stream needs request headers).
 
     What a provider's resolve() returns. It makes no network call of its own: see LiveProxyUnmuxed.register_channel for
     resolving the stream address later (empty *master_url* and a *url_refresher*), and for *headers* and
-    *refresh_on_failure*. *scheme* is the provider's: it lets the service extensions recognize the channel again
-    when its service is a reference to the proxy's address (an instant recording, a player that plays the address
-    itself)."""
+    *refresh_on_failure* and *session_param*. *scheme* is the provider's: it lets the service extensions recognize
+    the channel again when its service is a reference to the proxy's address (an instant recording, a player that
+    plays the address itself)."""
     LiveProxyUnmuxed.start()
     _owners[channel_id] = scheme.lower()
-    address = LiveProxyUnmuxed.register_channel(channel_id, master_url, url_refresher, headers, refresh_on_failure)
+    address = LiveProxyUnmuxed.register_channel(channel_id, master_url, url_refresher, headers, refresh_on_failure,
+                                               session_param)
     if headers and not callable(headers):
         address += LiveProxyUnmuxed.header_suffix(headers)
     return address
@@ -75,8 +77,7 @@ def _applyRegistration():
 
     playServiceExtension is what makes eServiceMP3 play the channels of the providers (through the proxy),
     recordServiceExtension what makes eServiceMP3Record record them. They are always installed: whether a provider's
-    channels go through the proxy is decided by the provider itself (a setting of its own, or never optional like
-    PlutoTV), by what its bouquet holds - the lazy address "<scheme>%3a//<channel id>" or the address of the stream.
+    channels go through the proxy is decided by the provider itself (a setting of its own, or never optional), by what its bouquet holds - the lazy address "<scheme>%3a//<channel id>" or the address of the stream.
     A lazy address left over in a bouquet is resolved either way."""
     if not _providers:
         return

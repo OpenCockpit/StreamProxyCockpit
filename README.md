@@ -12,11 +12,11 @@ Local stream proxy for the Open-Enigma2 plugins that provide FAST-channel stream
 - RakutenTVCockpit
 - SamsungTVCockpit
 
-## Installation
-No installation required. Will be installed as dependency if required.
-
-## Documentation
-How it works, the settings, how a plugin registers its channels and troubleshooting are described in the [StreamProxyCockpit wiki](https://github.com/OpenCockpit/StreamProxyCockpit/wiki).
-
 ## Limitations
 - Tested on OpenViX and OpenATV with DM900.
+
+## Installation
+The plugin will be installed as a dependency, no explicit installation required.
+
+## Wiki
+- https://github.com/OpenCockpit/StreamProxyCockpit/wiki

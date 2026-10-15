@@ -120,7 +120,7 @@ class HLSPlaylist:
 
         Diagnostic only, for now - LiveProxyUnmuxed's own pairing logic reacts to
         plain ``#EXT-X-DISCONTINUITY`` alone and doesn't parse or act on any
-        of these. This exists to find out whether Pluto's demuxed playlists
+        of these. This exists to find out whether the demuxed playlists of the providers
         actually carry richer ad-boundary metadata at all before spending
         effort building real handling around it - see callers for where the
         results get logged.
