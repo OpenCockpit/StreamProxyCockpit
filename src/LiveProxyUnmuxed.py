@@ -230,7 +230,7 @@ _COLD_START_FIRST_SEGMENT_WAIT = 5.0  # seconds _handle_playlist waits, on a cha
 #                              # gap) exactly as before this existed - no regression
 #                              # risk for a channel that's still legitimately slow
 #                              # past this budget.
-_VOD_COLD_START_MIN_SEGMENTS = 5  # VOD only: _handle_playlist's cold-start wait holds
+_VOD_COLD_START_MIN_SEGMENTS = 3  # VOD only: _handle_playlist's cold-start wait holds
 #                              # out for at least this many ready segments (not just
 #                              # the first one) before replying, up to
 #                              # _VOD_COLD_START_WAIT. Motivated by a production
@@ -246,6 +246,20 @@ _VOD_COLD_START_MIN_SEGMENTS = 5  # VOD only: _handle_playlist's cold-start wait
 #                              # should start the instant anything is available, and
 #                              # live's own continuous real-time production rate means
 #                              # there's nothing to batch up even if it waited.
+#                              # 3 segments are 15 s of video, far more than the player
+#                              # needs to keep going until its next playlist re-poll, and
+#                              # waiting for 5 added about two more segments of
+#                              # fetch+decrypt+mux (0.7 s each on a Dreambox) to every
+#                              # VOD start.
+_VOD_AUDIO_PREPOPULATE_CAP = 4  # VOD only: the audio head start _handle_playlist fetches
+#                              # synchronously before it replies. The video cold start
+#                              # waits for _VOD_COLD_START_MIN_SEGMENTS segments, which
+#                              # need that many audio segments plus one; the background
+#                              # audio pre-fetch (paced by _PREFETCH_LEAD_SEGMENTS) brings
+#                              # the rest in while the first segments are muxed. The
+#                              # general _AUDIO_PREPOPULATE_CAP of 10 made the reply wait
+#                              # for audio that was fetched twice (again by the background
+#                              # pre-fetch) and not needed yet.
 _VOD_COLD_START_WAIT = 10.0    # VOD-only cold-start budget, replacing
 #                              # _COLD_START_FIRST_SEGMENT_WAIT's shorter one - waiting
 #                              # for _VOD_COLD_START_MIN_SEGMENTS to actually be ready
@@ -3341,10 +3355,11 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                 # video pre-fetch threads (already started elsewhere, and
                 # paced by _PREFETCH_LEAD_SEGMENTS) pick up everything beyond
                 # this.
-                asegs_pre = asegs_pre[:_AUDIO_PREPOPULATE_CAP]
-                akey_pre = akey_pre[:_AUDIO_PREPOPULATE_CAP]
-                aiv_pre = aiv_pre[:_AUDIO_PREPOPULATE_CAP]
-                adisc_pre = adisc_pre[:_AUDIO_PREPOPULATE_CAP]
+                prepopulate_cap = _VOD_AUDIO_PREPOPULATE_CAP if channel_id.startswith('vod') else _AUDIO_PREPOPULATE_CAP
+                asegs_pre = asegs_pre[:prepopulate_cap]
+                akey_pre = akey_pre[:prepopulate_cap]
+                aiv_pre = aiv_pre[:prepopulate_cap]
+                adisc_pre = adisc_pre[:prepopulate_cap]
 
                 def _pre_fetch_one(seq, url, key_url, iv_explicit):
                     adata = _fetch(url, binary=True, timeout=state.seg_duration * 0.8,
