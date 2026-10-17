@@ -34,6 +34,7 @@ import subprocess
 import threading
 import time
 from collections import OrderedDict, namedtuple
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Optional
 from urllib.parse import urljoin
 
@@ -319,6 +320,7 @@ class _MuxedChannel:
         self._last_playlist = -math.inf               # when a playlist was last asked for
         self._hold_until = 0.0                        # until when the newest segments are held back from it
         self._start_target = 1                        # segments in the ring before the channel counts as ready
+        self._created = time.monotonic()
         if inherit is not None:
             # replaces a poller that stopped under a recorder: continue its timeline and continuity counters, so the
             # recording stays one continuous file; the first segment is a discontinuity of the source
@@ -385,6 +387,7 @@ class _MuxedChannel:
             self._last_playlist = now
             holding = now < self._hold_until
         hold = _hold_count([duration for _seq, (_data, duration) in ready]) if holding else 0
+        hold = min(hold, max(0, len(ready) - self._start_target))   # a cold channel has only the segments the player starts with
         if len(ready) > hold:
             ready = ready[:len(ready) - hold]
         items = ready[-_PLAYLIST_SEGMENTS:]
@@ -493,6 +496,7 @@ class _MuxedChannel:
             if next_seq is None and segments:
                 next_seq = segments[0].seq if media.endlist else segments[max(0, len(segments) - _start_count(segments))].seq
             fresh = []
+            preloaded: dict = {}
             if segments:
                 if next_seq < segments[0].seq:
                     logger.debug('%s: fell behind the playlist, seq %s -> %s', self.channel_id, next_seq, segments[0].seq)
@@ -500,14 +504,18 @@ class _MuxedChannel:
                     self._lost = True
                 fresh = [s for s in segments if s.seq >= next_seq]
             if not self.status:
-                # The player is only told about the channel (and given a playlist) when this many segments are ready.
-                # With just the first one in the playlist it plays it, and has nothing left when it reloads the
-                # playlist a target duration (6s for 5.1s segments) after its first request: a hiccup after about 5s.
-                self._start_target = max(1, min(len(fresh), _start_count(segments)))
+                # The player is only told about the channel (and given a playlist) when this many segments are ready:
+                # those it starts with. With just the first one in the playlist it plays it, and has nothing left when
+                # it reloads the playlist a target duration (6s for 5.1s segments) after its first request: a hiccup
+                # after about 5s. The segments that are held back from a starting player (_hold_count) are not waited
+                # for: it doesn't get them in its first playlist anyway, and they are ready when it reloads.
+                self._start_target = max(1, min(len(fresh), _back_count(segments)))
+                # download and remux these in parallel (the timeline is rewritten one after the other below)
+                preloaded = self._preload(fresh[:self._start_target]) if self._start_target > 1 else {}
             for seg in fresh:
                 if self._stop.is_set():
                     return
-                self._handle_segment(seg)
+                self._handle_segment(seg, preloaded.pop(seg.seq, None))
                 next_seq = seg.seq + 1
                 last_progress = time.monotonic()
             if not self.status and self.ready:
@@ -584,15 +592,31 @@ class _MuxedChannel:
         ts, self._cc = _patch_continuity(ts, self._cc)
         return ts
 
-    def _handle_segment(self, seg: Segment):
+    def _load(self, seg: Segment) -> 'tuple[bytes, float, float] | None':
+        """Download, decrypt and remux *seg*: (remuxed data, seconds to fetch, seconds to remux), None if it can't be had."""
         t_start = time.monotonic()
         data = self._fetch_segment(seg)
         if data is None:
+            return None
+        t_fetched = time.monotonic()
+        remuxed = self._normalize(data)
+        return remuxed, t_fetched - t_start, time.monotonic() - t_fetched
+
+    def _preload(self, segments: 'list[Segment]') -> 'dict[int, Future]':
+        """Start loading *segments* at once. The start of a channel needs several of them and downloading and
+        remuxing (ffmpeg, a separate process) one after the other was most of the time it took."""
+        pool = ThreadPoolExecutor(max_workers=len(segments), thread_name_prefix=f'MuxedLoad-{self.channel_id[:8]}')
+        futures = {seg.seq: pool.submit(self._load, seg) for seg in segments}
+        pool.shutdown(wait=False)   # the workers end with their segment
+        return futures
+
+    def _handle_segment(self, seg: Segment, preloaded: 'Optional[Future]' = None):
+        loaded = preloaded.result() if preloaded is not None else self._load(seg)
+        if loaded is None:
             logger.debug('%s: segment %s lost', self.channel_id, seg.seq)
             self._lost = True
             return
-        t_fetched = time.monotonic()
-        remuxed = self._normalize(data)
+        remuxed, fetch_time, remux_time = loaded
         t_remuxed = time.monotonic()
         ts = _mark_idr_delimiters(remuxed)
         disc = seg.disc or self._lost
@@ -606,12 +630,14 @@ class _MuxedChannel:
             self.ready[self._next_seq] = (out, duration)
             logger.debug('%s: segment %s (cdn %s, %.1fs, %s bytes) ready: fetch %.2fs, remux %.2fs, rewrite %.2fs, %s in the ring',
                          self.channel_id, self._next_seq, seg.seq, duration, len(out),
-                         t_fetched - t_start, t_remuxed - t_fetched, t_done - t_remuxed, len(self.ready))
+                         fetch_time, remux_time, t_done - t_remuxed, len(self.ready))
             self._next_seq += 1
             while len(self.ready) > _MAX_READY:
                 self.ready.popitem(last=False)
             if not self.status and len(self.ready) >= self._start_target:
                 self.status = 'ok'
+                logger.debug('%s: muxed channel ready %.2fs after it was created (%s segments)',
+                             self.channel_id, time.monotonic() - self._created, len(self.ready))
             self.cond.notify_all()
 
 

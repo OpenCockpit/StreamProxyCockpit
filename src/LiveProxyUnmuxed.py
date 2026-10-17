@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import urljoin, urlparse, parse_qs
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import requests
 
@@ -230,7 +230,7 @@ _COLD_START_FIRST_SEGMENT_WAIT = 5.0  # seconds _handle_playlist waits, on a cha
 #                              # gap) exactly as before this existed - no regression
 #                              # risk for a channel that's still legitimately slow
 #                              # past this budget.
-_VOD_COLD_START_MIN_SEGMENTS = 3  # VOD only: _handle_playlist's cold-start wait holds
+_VOD_COLD_START_MIN_SEGMENTS = 2  # VOD only (was 3; 1 froze shortly after the start - see the stall below): _handle_playlist's cold-start wait holds
 #                              # out for at least this many ready segments (not just
 #                              # the first one) before replying, up to
 #                              # _VOD_COLD_START_WAIT. Motivated by a production
@@ -251,6 +251,8 @@ _VOD_COLD_START_MIN_SEGMENTS = 3  # VOD only: _handle_playlist's cold-start wait
 #                              # waiting for 5 added about two more segments of
 #                              # fetch+decrypt+mux (0.7 s each on a Dreambox) to every
 #                              # VOD start.
+_VOD_PRELOAD_SEGMENTS = 4       # VOD only: video segments _handle_playlist starts downloading at the first playlist
+#                              # request (the video loop uses them), whatever the cold-start wait is
 _VOD_AUDIO_PREPOPULATE_CAP = 4  # VOD only: the audio head start _handle_playlist fetches
 #                              # synchronously before it replies. The video cold start
 #                              # waits for _VOD_COLD_START_MIN_SEGMENTS segments, which
@@ -808,7 +810,7 @@ class _ChannelState:
                  '_audio_prefetch_thread', '_audio_prefetch_stop',
                  '_video_prefetch_thread', '_video_prefetch_stop', '_lock', '_cc_state',
                  '_cc_resync_pending', '_last_playlist_out', '_last_segment_out',
-                 '_pending_audio_floors', '_vod_complete',
+                 '_pending_audio_floors', '_vod_complete', '_video_preload', '_video_first_playlist',
                  '_live_delta', '_live_expected', '_live_prev_end', '_live_gap',
                  '_window_delta', '_shift_cache')
 
@@ -931,6 +933,10 @@ class _ChannelState:
         self._live_gap = _LIVE_GAP_TICKS  # measured distance between one window's end and the next one's start
         self._window_delta: dict = {}    # chunk_seq -> the shift of that window
         self._shift_cache: dict = {}     # chunk_seq -> (muxed bytes, shifted bytes) of the latest served
+        self._video_preload: 'dict[str, Future]' = {}   # VOD start only: video segment url -> its download, started
+        #                                 # by _handle_playlist while the audio is still being fetched
+        self._video_first_playlist: 'tuple[str, str] | None' = None   # VOD start only: (url, text) of the video
+        #                                 # playlist _handle_playlist just fetched, for the video loop's first poll
         self._vod_complete = False       # VOD only: every segment of the asset has been fetched
         #                                 # and muxed (set by _video_prefetch_loop); lets
         #                                 # _handle_playlist finally advertise #EXT-X-ENDLIST
@@ -1247,6 +1253,8 @@ class _ChannelState:
         with self._lock:
             self._last_segment_out = None
             self._last_playlist_out.clear()
+            self._video_preload.clear()
+            self._video_first_playlist = None
 
     def close_and_release(self, channel_id: str):
         """close(), then release() once the pre-fetch threads are really gone (they own the buffers until then)."""
@@ -2381,7 +2389,10 @@ def _video_prefetch_loop(channel_id: str, state: '_ChannelState',
             continue
         variant_url = urls[variant_idx]
 
-        vtext = _fetch(variant_url, tag='video-prefetch:playlist', headers=state.headers)
+        first_playlist, state._video_first_playlist = state._video_first_playlist, None
+        vtext = first_playlist[1] if first_playlist and first_playlist[0] == variant_url else None
+        if not vtext:
+            vtext = _fetch(variant_url, tag='video-prefetch:playlist', headers=state.headers)
         if not vtext:
             if state._video_prefetch_stop.wait(timeout=state.seg_duration / 5):
                 break
@@ -2537,8 +2548,11 @@ def _video_prefetch_loop(channel_id: str, state: '_ChannelState',
                 state._video_buf = _RenditionBuffer(video_epoch, is_disc_epoch=True)
                 state._video_cursor_pts = None
 
-            vdata = _fetch(url, binary=True, timeout=state.seg_duration * 0.8,
-                           tag='video-prefetch:segment', headers=state.headers)
+            preload = state._video_preload.pop(url, None)
+            vdata = preload.result() if preload is not None else None   # started at the first playlist request
+            if not vdata:
+                vdata = _fetch(url, binary=True, timeout=state.seg_duration * 0.8,
+                               tag='video-prefetch:segment', headers=state.headers)
             if not vdata:
                 continue
 
@@ -3000,6 +3014,14 @@ def _base_url(text, requested_url: str) -> str:
     return (getattr(text, 'url', '') or requested_url).split('?')[0].rsplit('/', 1)[0] + '/'
 
 
+def _background(func, *args, **kwargs) -> Future:
+    """Run func(*args, **kwargs) on a thread of its own; the Future has its result."""
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='proxy-bg')
+    future = pool.submit(func, *args, **kwargs)
+    pool.shutdown(wait=False)   # the worker ends with the call
+    return future
+
+
 def _fetch(url: str, binary: bool = False, timeout: int = 6, tag: str = '', headers: 'dict | None' = None):
     """Fetch *url* and return text or bytes; returns None on any error.
 
@@ -3278,7 +3300,16 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
         # Fetch the video variant playlist.  Audio segments are fetched
         # independently by the per-channel pre-fetch thread and stored in the
         # PTS ring; this handler only needs to know the video segment URLs.
+        t_begin = time.monotonic()
+        is_vod = channel_id.startswith('vod')
+        audio_playlist = None
+        if is_vod and state.audio_url and not state._audio_prepopulated:
+            # A VOD playlist lists the whole asset and takes the CDN a while to produce: ask for the audio one
+            # (needed below) while the video one is on its way.
+            audio_playlist = _background(_fetch, state.audio_url, tag='handler:playlist-prepopulate',
+                                         headers=state.headers)
         vtext = _fetch(state.variant_urls[idx], tag='handler:playlist', headers=state.headers)
+        t_variant = time.monotonic()
         if not vtext:
             # A transient CDN blip on this fetch used to surface straight to
             # Enigma2 as a 502 on what looks like a routine manifest refresh
@@ -3329,8 +3360,23 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
         # requests the first video segment.  On subsequent refreshes the
         # background pre-fetch thread keeps the ring topped up; we skip this
         # block to avoid redundant fetches.
+        t_audio_playlist = t_audio = t_variant
+        prepopulated = False
+        if is_vod and not state.has_ready_segs():
+            # The first video segments are not used before the audio is in, but nothing keeps them from being
+            # downloaded meanwhile (the video loop takes them from here): that was a good part of the wait below.
+            state._video_first_playlist = (state.variant_urls[idx], vtext)   # the video loop's first poll
+            for url in vsegs[:_VOD_PRELOAD_SEGMENTS]:
+                if url not in state._video_preload:
+                    state._video_preload[url] = _background(_fetch, url, binary=True, timeout=state.seg_duration * 0.8,
+                                                            tag='video-prefetch:segment', headers=state.headers)
         if state.audio_url and state.try_start_audio_prepopulate():
-            atext_pre = _fetch(state.audio_url, tag='handler:playlist-prepopulate', headers=state.headers)
+            prepopulated = True
+            if audio_playlist is not None:
+                atext_pre = audio_playlist.result()
+            else:
+                atext_pre = _fetch(state.audio_url, tag='handler:playlist-prepopulate', headers=state.headers)
+            t_audio_playlist = time.monotonic()
             if atext_pre:
                 abase_pre = state.audio_url.split('?')[0].rsplit('/', 1)[0] + '/'
                 try:
@@ -3396,6 +3442,7 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                     _append_audio(state, channel_id, seq, disc, adata)
                 logger.debug('%s: pre-populated audio buffer with %s segment(s)',
                              channel_id, len(pre_results))
+            t_audio = time.monotonic()
 
         # Start the video pre-fetch+mux thread on the first playlist request.
         # It polls the variant playlist independently, pre-muxes every new
@@ -3424,7 +3471,6 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             # window (_VOD_COLD_START_MIN_SEGMENTS), not just the first
             # segment - see that constant's own comment - using the longer
             # _VOD_COLD_START_WAIT budget to match.
-            is_vod = channel_id.startswith('vod')
             budget = _VOD_COLD_START_WAIT if is_vod else _COLD_START_FIRST_SEGMENT_WAIT
             # A diagnostic test (temporarily forcing this to 1) confirmed
             # the reported A/V offset persists even when this cold-start
@@ -3435,8 +3481,14 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             # exists for.
             min_segs = _VOD_COLD_START_MIN_SEGMENTS if is_vod else 1
             cold_deadline = time.monotonic() + budget
+            t_wait = time.monotonic()
             while state.ready_seg_count() < min_segs and time.monotonic() < cold_deadline:
                 time.sleep(0.05)
+            logger.debug('%s: first playlist: variant playlist %.2fs, audio playlist %.2fs, audio segments %.2fs%s, '
+                         'waited %.2fs for %s ready segment(s), %s ready',
+                         channel_id, t_variant - t_begin, t_audio_playlist - t_variant, t_audio - t_audio_playlist,
+                         '' if prepopulated else ' (not pre-populated)', time.monotonic() - t_wait, min_segs,
+                         state.ready_seg_count())
 
         # Rewrite the video playlist: keep the CDN's own structural tags
         # (#EXTM3U, #EXT-X-VERSION, #EXT-X-TARGETDURATION, ...) but replace
