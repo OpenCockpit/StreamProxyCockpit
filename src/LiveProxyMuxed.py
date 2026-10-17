@@ -91,6 +91,22 @@ def _variant_urls(text: str, base: str) -> 'list[str]':
     return [url for _bw, url in variants]
 
 
+def _variant_summary(text: str) -> str:
+    """The variants of a master playlist as 'bandwidth resolution', highest bandwidth first - the first is the one played."""
+    found = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith('#EXT-X-STREAM-INF:'):
+            continue
+        try:
+            bandwidth = int(HLSPlaylist.attr_value('BANDWIDTH', line) or 0)
+        except ValueError:
+            bandwidth = 0
+        found.append((bandwidth, HLSPlaylist.attr_value('RESOLUTION', line) or '?'))
+    found.sort(key=lambda v: v[0], reverse=True)
+    return ', '.join(f'{bandwidth / 1e6:.2f} Mbit/s {resolution}' for bandwidth, resolution in found) or 'none'
+
+
 def _back_count(segments: 'list[Segment]') -> int:
     """How many of the newest *segments* a channel starts with: enough for _START_BACK_SECONDS of content, and at
     least _START_BACK_SEGMENTS. Three segments are only three seconds of content if the stream starts with one
@@ -433,6 +449,8 @@ class _MuxedChannel:
         if '#EXT-X-STREAM-INF' not in text:
             return master_url
         variants = _variant_urls(text, master_url)
+        logger.debug('%s: master playlist variants (highest first, the first is played): %s',
+                     self.channel_id, _variant_summary(text))
         return variants[0] if variants else None
 
     def _loop(self):

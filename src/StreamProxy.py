@@ -66,7 +66,7 @@ def registerChannel(scheme, channel_id, master_url="", url_refresher=None, heade
     LiveProxyUnmuxed.start()
     _owners[channel_id] = scheme.lower()
     address = LiveProxyUnmuxed.register_channel(channel_id, master_url, url_refresher, headers, refresh_on_failure,
-                                               session_param)
+                                                session_param)
     if headers and not callable(headers):
         address += LiveProxyUnmuxed.header_suffix(headers)
     return address
