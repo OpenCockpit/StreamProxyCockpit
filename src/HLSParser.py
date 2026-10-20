@@ -50,16 +50,20 @@ class HLSPlaylist:
         track plus a hearing-impaired or audio-description track - so
         picking "whichever line appears last" (the previous behaviour) can
         silently select the accessibility track instead of the main one.
-        Prefers DEFAULT=YES, then the first non-accessibility rendition,
-        then just the first rendition listed.
+        Prefers a DEFAULT=YES rendition that is not an accessibility one, then the first non-accessibility
+        rendition, then a DEFAULT=YES one, then just the first rendition listed. (An audio description track
+        marked DEFAULT=YES used to win over the main track.)
         """
         if not candidates:
             return None
-        for uri, is_default, _ in candidates:
-            if is_default:
+        for uri, is_default, is_accessibility in candidates:
+            if is_default and not is_accessibility:
                 return uri
         for uri, _, is_accessibility in candidates:
             if not is_accessibility:
+                return uri
+        for uri, is_default, _ in candidates:
+            if is_default:
                 return uri
         return candidates[0][0]
 

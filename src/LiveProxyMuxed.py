@@ -565,9 +565,14 @@ class _MuxedChannel:
         return None
 
     def _normalize(self, data: bytes) -> bytes:
-        """Remux (stream copy) so the PIDs/PAT/PMT are the same for every segment, whatever the source layout."""
+        """Remux (stream copy) so the PIDs/PAT/PMT are the same for every segment, whatever the source layout.
+
+        -pes_payload_size 0 gives every audio frame its own PES packet and PTS, like the source segments; the muxer's
+        default packs about 11 frames (235 ms) under one PTS, which the Dreambox's audio decoder played at a different
+        offset from the picture (seen on the unmuxed Pluto path, see LiveProxyUnmuxed._ffmpeg_mux)."""
         cmd = [_FFMPEG, '-loglevel', 'error', '-probesize', '1000000', '-analyzeduration', '2000000', '-i', 'pipe:0',
-               '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', '-copyts', '-f', 'mpegts', '-pat_period', '2', 'pipe:1']
+               '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', '-copyts', '-f', 'mpegts', '-pes_payload_size', '0',
+               '-pat_period', '2', 'pipe:1']
         try:
             r = subprocess.run(cmd, input=data, capture_output=True, timeout=_FFMPEG_TIMEOUT, check=False)
             if r.returncode == 0 and r.stdout:
