@@ -64,6 +64,7 @@ _SEGMENT_TIMEOUT = 15
 _PLAYLIST_TIMEOUT = 8
 _SEGMENT_WAIT = 8.0            # how long a segment request waits for a segment that isn't ready yet
 _DEFAULT_SEG_DURATION = 5.0
+_JUMP_TICKS = 90000   # a segment starting more than this (1 s) away from where the previous one ended is a timeline jump
 _RESOLVE_RETRY_FAILURES = 3    # consecutive playlist failures before the media playlist url is looked up again
 
 Segment = namedtuple('Segment', 'seq uri duration disc key_uri iv')
@@ -281,6 +282,118 @@ def _mark_idr_delimiters(ts: bytes) -> bytes:
     return bytes(buf)
 
 
+_PASSTHROUGH = True   # a source with a stable PID layout is served as the CDN made it, not remuxed
+
+
+def _stream_layout(ts: bytes) -> 'tuple | None':
+    """(PMT pid, PCR pid, ((stream type, pid), ...)) from the first PAT and PMT in *ts*, None if they can't be read."""
+    pmt_pid = None
+    for off in range(0, min(len(ts) - 187, 188 * 200), 188):
+        if ts[off] != 0x47 or not ts[off + 1] & 0x40:
+            continue
+        afc = (ts[off + 3] >> 4) & 3
+        if not afc & 1:
+            continue
+        pid = ((ts[off + 1] & 0x1F) << 8) | ts[off + 2]
+        sec = off + 4 + (1 + ts[off + 4] if afc & 2 else 0)
+        sec += 1 + ts[sec]   # pointer field
+        if sec + 12 > off + 188:
+            continue
+        if pid == 0 and pmt_pid is None and ts[sec] == 0:
+            end = min(sec + 3 + (((ts[sec + 1] & 0x0F) << 8) | ts[sec + 2]) - 4, off + 188)
+            for p in range(sec + 8, end - 3, 4):
+                if ts[p] or ts[p + 1]:   # program number 0 is the network PID
+                    pmt_pid = ((ts[p + 2] & 0x1F) << 8) | ts[p + 3]
+                    break
+        elif pmt_pid is not None and pid == pmt_pid and ts[sec] == 2:
+            end = sec + 3 + (((ts[sec + 1] & 0x0F) << 8) | ts[sec + 2]) - 4
+            if end > off + 188:
+                return None
+            pcr_pid = ((ts[sec + 8] & 0x1F) << 8) | ts[sec + 9]
+            p = sec + 12 + (((ts[sec + 10] & 0x0F) << 8) | ts[sec + 11])
+            streams = []
+            while p + 5 <= end:
+                streams.append((ts[p], ((ts[p + 1] & 0x1F) << 8) | ts[p + 2]))
+                p += 5 + (((ts[p + 3] & 0x0F) << 8) | ts[p + 4])
+            return (pmt_pid, pcr_pid, tuple(streams)) if streams else None
+    return None
+
+
+_AUDIO_STREAM_TYPES = (0x03, 0x04, 0x0F, 0x11, 0x81)   # MPEG audio, AAC (ADTS, LATM), AC-3
+_VIDEO_STREAM_TYPES = (0x01, 0x02, 0x1B, 0x24)          # MPEG video, H.264, H.265
+
+
+def _frame_ticks(pts_list: list, default: int) -> int:
+    """The most common distance between consecutive distinct timestamps (one frame), *default* if there are too few."""
+    distinct = sorted(set(pts_list))
+    gaps: dict = {}
+    for a, b in zip(distinct, distinct[1:]):
+        gaps[b - a] = gaps.get(b - a, 0) + 1
+    return max(gaps, key=gaps.get) if gaps else default
+
+
+def _pes_start_pts(ts: bytes, pid: int) -> list:
+    """PTS of every PES packet that starts in the packets of *pid* (found with bytes.find, not a loop over all packets)."""
+    marker = bytes((0x47, 0x40 | (pid >> 8), pid & 0xFF))
+    out = []
+    pos = ts.find(marker)
+    while pos >= 0:
+        if pos % 188 == 0:
+            afc = (ts[pos + 3] >> 4) & 3
+            pl = pos + 4 + (1 + ts[pos + 4] if afc & 2 else 0)
+            if afc & 1 and pl + 14 <= pos + 188 and ts[pl:pl + 3] == b'\x00\x00\x01' and ts[pl + 7] & 0x80:
+                b = ts[pl + 9:pl + 14]
+                out.append(((b[0] & 0x0E) << 29) | (b[1] << 22) | ((b[2] & 0xFE) << 14) | (b[3] << 7) | ((b[4] & 0xFE) >> 1))
+        pos = ts.find(marker, pos + 188)
+    return out
+
+
+def _stream_spans(ts: bytes) -> 'tuple | None':
+    """(audio pid, audio (first, last, frame), video (first, last, frame)) of the timestamps in *ts*, None unless the
+    segment has one audio and one video stream with timestamps. first/last are the smallest/largest PTS of the stream."""
+    layout = _stream_layout(ts)
+    if layout is None:
+        return None
+    apid = next((pid for st, pid in layout[2] if st in _AUDIO_STREAM_TYPES), None)
+    vpid = next((pid for st, pid in layout[2] if st in _VIDEO_STREAM_TYPES), None)
+    if apid is None or vpid is None:
+        return None
+    apts = _pes_start_pts(ts, apid)
+    vpts = _pes_start_pts(ts, vpid)
+    if not apts or not vpts:
+        return None
+    return (apid, (min(apts), max(apts), _frame_ticks(apts, 1920)), (min(vpts), max(vpts), _frame_ticks(vpts, 3003)))
+
+
+def _drop_early_audio(ts: bytes, apid: int, limit: int) -> 'tuple[bytes, int]':
+    """*ts* without the audio PES packets at its start whose PTS is before *limit* (their TS packets become null
+    packets). Returns (data, number of PES packets dropped)."""
+    buf = bytearray(ts)
+    dropped = 0
+    for off in range(0, len(buf) - 187, 188):
+        if buf[off] != 0x47 or ((buf[off + 1] & 0x1F) << 8 | buf[off + 2]) != apid:
+            continue
+        if buf[off + 1] & 0x40:
+            afc = (buf[off + 3] >> 4) & 3
+            pl = off + 4 + (1 + buf[off + 4] if afc & 2 else 0)
+            if afc & 1 and pl + 14 <= off + 188 and buf[pl:pl + 3] == b'\x00\x00\x01' and buf[pl + 7] & 0x80:
+                b = buf[pl + 9:pl + 14]
+                pts = ((b[0] & 0x0E) << 29) | (b[1] << 22) | ((b[2] & 0xFE) << 14) | (b[3] << 7) | ((b[4] & 0xFE) >> 1)
+                if _signed33(pts - limit) >= 0:
+                    break
+                dropped += 1
+        buf[off + 1] = 0x1F
+        buf[off + 2] = 0xFF
+        buf[off + 3] = 0x10
+        buf[off + 4:off + 188] = b'\xff' * 184
+    return bytes(buf), dropped
+
+
+def _signed33(value: int) -> int:
+    value &= _PTS_MASK
+    return value - (1 << 33) if value >= 1 << 32 else value
+
+
 def _first_video_pid(ts: bytes) -> 'int | None':
     """The pid of the first video PES packet (stream id 0xE0-0xEF) within the first 400 packets of *ts*."""
     for off in range(0, min(len(ts) - 187, 188 * 400), 188):
@@ -315,8 +428,12 @@ class _MuxedChannel:
         self._cc: dict = {}                           # continuity counter chain
         self._delta = 0                               # timeline shift in effect
         self._expected = None                         # PTS the next segment should start at
+        self._a_end = None                            # PTS after the last audio frame sent, shifted
+        self._v_end = None                            # the same for video
         self._lost = False                            # a segment was lost: treat the next one as a discontinuity
         self._warned_ffmpeg = False
+        self._raw_layout = None        # PID layout of the first segment, served unchanged while the others match it
+        self._normalize_all = False    # a segment had another layout: remux every one from then on
         self._last_playlist = -math.inf               # when a playlist was last asked for
         self._hold_until = 0.0                        # until when the newest segments are held back from it
         self._start_target = 1                        # segments in the ring before the channel counts as ready
@@ -327,6 +444,8 @@ class _MuxedChannel:
             self._cc = dict(inherit._cc)
             self._delta = inherit._delta
             self._expected = inherit._expected
+            self._a_end = inherit._a_end
+            self._v_end = inherit._v_end
             self._lost = True
 
     # -- public --
@@ -569,7 +688,24 @@ class _MuxedChannel:
 
         -pes_payload_size 0 gives every audio frame its own PES packet and PTS, like the source segments; the muxer's
         default packs about 11 frames (235 ms) under one PTS, which the Dreambox's audio decoder played at a different
-        offset from the picture (seen on the unmuxed Pluto path, see LiveProxyUnmuxed._ffmpeg_mux)."""
+        offset from the picture (seen on the unmuxed Pluto path, see LiveProxyUnmuxed._ffmpeg_mux).
+
+        The remux itself changes more than the PIDs (PCR every 0.1 s instead of per frame, the PCR running 0.7 s
+        instead of the source's 1.0 s behind the PTS): Hogan's Heroes played extremely out of sync through it, direct
+        playback of the same segments in sync. As long as every segment has the PID layout of the first one, the
+        segments are therefore served as they came from the CDN (only the timeline and continuity counters are
+        continued afterwards, see _continuize)."""
+        if _PASSTHROUGH and not self._normalize_all:
+            layout = _stream_layout(data)
+            if layout is not None:
+                if self._raw_layout is None:
+                    self._raw_layout = layout
+                    logger.debug('%s: stream layout %s | Action: segments are served unchanged', self.channel_id, layout)
+                if layout == self._raw_layout:
+                    return data
+                logger.debug('%s: stream layout changed %s -> %s | Action: every segment is remuxed from now on',
+                             self.channel_id, self._raw_layout, layout)
+            self._normalize_all = True
         cmd = [_FFMPEG, '-loglevel', 'error', '-probesize', '1000000', '-analyzeduration', '2000000', '-i', 'pipe:0',
                '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', '-copyts', '-f', 'mpegts', '-pes_payload_size', '0',
                '-pat_period', '2', 'pipe:1']
@@ -588,14 +724,62 @@ class _MuxedChannel:
         """Keep the timeline and the continuity counters running over a discontinuity."""
         first = _first_pts(ts)
         if first is not None:
-            if (disc or _segment_is_disc(ts)) and self._expected is not None:
-                delta = (self._expected - first) & _PTS_MASK
-                self._delta = delta - (1 << 33) if delta >= 1 << 32 else delta   # signed, 33-bit
+            disc = disc or _segment_is_disc(ts)
+            spans = _stream_spans(ts)
+            if spans is not None:
+                ts = self._continue_streams(ts, seg, disc, spans)
+                ts, self._cc = _patch_continuity(ts, self._cc)
+                return ts
+            if not disc and self._expected is not None:
+                # The CDN tags only some of its timeline jumps (ad clips come with timestamps of their own, one served
+                # segment at +130 s, the next one at -5 s, then the programme again at -130 s, none flagged). Played
+                # as they were, the decoders lose their sync at each jump and the sound stays off until the next
+                # zap (VIDEO0 "pts error", 2.5 s behind the STC, at the end of every ad break).
+                gap = _signed33(first + self._delta - self._expected)
+                if abs(gap) > _JUMP_TICKS:
+                    disc = True
+                    logger.debug('%s: segment %s starts %.1fs off the timeline without a discontinuity tag | Action: continued as one',
+                                 self.channel_id, seg.seq, gap / 90000)
+            if disc and self._expected is not None:
+                self._delta = _signed33(self._expected - first)
             ticks = int(seg.duration * 90000) if seg.duration > 0 else int(_DEFAULT_SEG_DURATION * 90000)
             self._expected = (first + self._delta + ticks) & _PTS_MASK
+            self._a_end = self._v_end = None
             ts = _rewrite_timeline(ts, self._delta)
         ts, self._cc = _patch_continuity(ts, self._cc)
         return ts
+
+    def _continue_streams(self, ts: bytes, seg: Segment, disc: bool, spans: tuple) -> bytes:
+        """The timeline of a segment with one audio and one video stream.
+
+        At a discontinuity (tagged by the CDN, or a jump of more than a second that it didn't tag) the segment is
+        shifted so that its video continues exactly where the video of the previous one ended; the audio keeps its
+        place relative to the picture, as the source has it (an ad clip and the programme start their sound a different
+        time before their picture). Where that makes the audio overlap the end of the previous segment (80 ms at the
+        end of an ad break), the overlapping audio frames at its start are dropped: the decoder of the box doesn't cut
+        such an overlap, it plays the frames one after the other, and the sound is late from then on."""
+        apid, (a_min, a_max, a_frame), (v_min, v_max, v_frame) = spans
+        if not disc and self._v_end is not None:
+            gap = _signed33(v_min + self._delta - self._v_end)
+            if abs(gap) > _JUMP_TICKS:
+                disc = True
+                logger.debug('%s: segment %s starts %.1fs off the timeline without a discontinuity tag | Action: continued as one',
+                             self.channel_id, seg.seq, gap / 90000)
+        if self._v_end is None and self._expected is not None:
+            self._v_end = self._a_end = self._expected   # the timeline of a segment before streams could be told apart
+        if disc and self._v_end is not None:
+            self._delta = _signed33(self._v_end - v_min)
+        out = _rewrite_timeline(ts, self._delta) if self._delta else ts
+        if disc and self._a_end is not None:
+            overlap = _signed33(self._a_end - (a_min + self._delta))
+            if 0 < overlap <= _JUMP_TICKS:
+                out, dropped = _drop_early_audio(out, apid, self._a_end)
+                logger.debug('%s: segment %s: audio overlaps the previous one by %.0f ms | Action: %s audio frame(s) dropped',
+                             self.channel_id, seg.seq, overlap / 90, dropped)
+        self._v_end = (v_max + self._delta + v_frame) & _PTS_MASK
+        self._a_end = (a_max + self._delta + a_frame) & _PTS_MASK
+        self._expected = self._v_end
+        return out
 
     def _load(self, seg: Segment) -> 'tuple[bytes, float, float] | None':
         """Download, decrypt and remux *seg*: (remuxed data, seconds to fetch, seconds to remux), None if it can't be had."""
