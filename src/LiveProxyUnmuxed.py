@@ -814,6 +814,13 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
         label = 'av' if audio_data else ('silence' if v_pts is not None else 'video-only')
         logger.debug('_ffmpeg_mux %s rc=%s out=%sb: %s',
                      label, r.returncode, len(r.stdout), r.stderr.decode(errors="replace")[-300:])
+        if audio_data and v_pts is not None:
+            # The audio slice had no usable audio (a window of a few frames at a stream splice): returning the video
+            # as it came would give a window without audio whose timestamps lack the offset of every muxed one (about
+            # 1.4 s: the timeline went back there and the decoder dropped audio). Mux it with silence instead.
+            logger.debug('_ffmpeg_mux: retry with silence instead of the unusable audio slice')
+            return _ffmpeg_mux(video_data, None, state, is_disc=is_disc, track_cc=track_cc, reset_cc=reset_cc,
+                               v_pts=v_pts)
         return video_data
     except Exception as exc:
         logger.debug('_ffmpeg_mux exception: %s', exc)
