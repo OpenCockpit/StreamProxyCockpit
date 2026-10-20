@@ -1475,11 +1475,7 @@ def _ensure_pipeline(channel_id: str, state: '_ChannelState') -> bool:
     if not text:
         return False
 
-    needs_mux = any(
-        line.startswith('#EXT-X-MEDIA:') and 'TYPE=AUDIO' in line
-        for line in text.splitlines()
-    )
-    if not needs_mux:
+    if not HLSPlaylist.needs_audio_mux(text):
         return False
 
     master_base = _base_url(text, state.master_url)
@@ -3258,11 +3254,8 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             return
         # Detect a separate audio rendition (EXT-X-MEDIA TYPE=AUDIO).  Only
         # demuxed streams need the muxing proxy; all others are redirected.
-        needs_mux = any(
-            line.startswith('#EXT-X-MEDIA:') and 'TYPE=AUDIO' in line
-            for line in text.splitlines()
-        )
-        if not needs_mux:
+        # (A rendition without URI is the audio of the video segments, see needs_audio_mux.)
+        if not HLSPlaylist.needs_audio_mux(text):
             # Plain muxed stream: LiveProxyMuxed keeps its ad breaks (discontinuities) from reaching the
             # decoder, or redirects Enigma2 straight to the real URL if the stream can't be processed.
             from . import LiveProxyMuxed  # deferred: LiveProxyMuxed imports from this module

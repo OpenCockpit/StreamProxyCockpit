@@ -41,6 +41,21 @@ class HLSPlaylist:
         return (urljoin(base_url, raw_uri), is_default, is_accessibility)
 
     @staticmethod
+    def needs_audio_mux(master_text: str) -> bool:
+        """True if the audio of a master playlist's streams comes from ``TYPE=AUDIO`` renditions with a ``URI``
+        and not from the video segments themselves.
+
+        A rendition without ``URI`` is, by the HLS rules, part of the variant stream: its audio is in the video
+        segments. Pluto's US channels declare such an ``Original`` rendition (DEFAULT=YES) next to an extra one
+        (a separate audio-description track). Treated as demuxed, the proxy took that extra track and mixed it
+        with the video, whose segments have another length and carry the real audio themselves: the sound
+        started early over ad breaks and drifted. Such a stream is a plain muxed one.
+        """
+        media = [line for line in master_text.splitlines()
+                 if line.startswith('#EXT-X-MEDIA:') and 'TYPE=AUDIO' in line]
+        return bool(media) and all(HLSPlaylist.attr_value('URI', line) for line in media)
+
+    @staticmethod
     def select_primary_audio(candidates: list) -> 'str | None':
         """Pick the main-program audio URI out of a master playlist's
         ``TYPE=AUDIO`` renditions (*candidates*, in playlist order, as
