@@ -348,9 +348,53 @@ def _pes_start_pts(ts: bytes, pid: int) -> list:
     return out
 
 
+_ADTS_RATES = (96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000)
+
+
+def _last_audio_duration(ts: bytes, pid: int) -> 'int | None':
+    """Ticks of audio in the last PES packet of *pid* in *ts*, counted in its AAC (ADTS) frames, None for any other audio.
+
+    A PES packet can hold several audio frames (4 in Rakuten's, 85 ms), the last one of a segment only what is left:
+    the end of the audio is then not the start of that packet plus the usual distance between two packets."""
+    marker = bytes((0x47, 0x40 | (pid >> 8), pid & 0xFF))
+    last = -1
+    pos = ts.find(marker)
+    while pos >= 0:
+        if pos % 188 == 0:
+            last = pos
+        pos = ts.find(marker, pos + 188)
+    if last < 0:
+        return None
+    payload = bytearray()
+    for off in range(last, len(ts) - 187, 188):
+        if ts[off] != 0x47 or ((ts[off + 1] & 0x1F) << 8 | ts[off + 2]) != pid:
+            continue
+        afc = (ts[off + 3] >> 4) & 3
+        pl = off + 4 + (1 + ts[off + 4] if afc & 2 else 0)
+        if not afc & 1:
+            continue
+        if off == last:
+            if ts[pl:pl + 3] != b'\x00\x00\x01':
+                return None
+            pl += 9 + ts[pl + 8]
+        payload += ts[pl:off + 188]
+    frames = ticks = 0
+    i = 0
+    while i + 7 <= len(payload) and payload[i] == 0xFF and payload[i + 1] & 0xF0 == 0xF0:
+        rate = (payload[i + 2] >> 2) & 15
+        length = ((payload[i + 3] & 3) << 11) | (payload[i + 4] << 3) | (payload[i + 5] >> 5)
+        if rate >= len(_ADTS_RATES) or length < 7:
+            break
+        frames += 1
+        ticks += 1024 * 90000 // _ADTS_RATES[rate]
+        i += length
+    return ticks if frames else None
+
+
 def _stream_spans(ts: bytes) -> 'tuple | None':
-    """(audio pid, audio (first, last, frame), video (first, last, frame)) of the timestamps in *ts*, None unless the
-    segment has one audio and one video stream with timestamps. first/last are the smallest/largest PTS of the stream."""
+    """(audio pid, audio (first, last, frame), video (first, last, frame), audio end) of the timestamps in *ts*, None
+    unless the segment has one audio and one video stream with timestamps. first/last are the smallest/largest PTS of
+    the stream, audio end is the duration of the audio in its last PES packet."""
     layout = _stream_layout(ts)
     if layout is None:
         return None
@@ -362,7 +406,9 @@ def _stream_spans(ts: bytes) -> 'tuple | None':
     vpts = _pes_start_pts(ts, vpid)
     if not apts or not vpts:
         return None
-    return (apid, (min(apts), max(apts), _frame_ticks(apts, 1920)), (min(vpts), max(vpts), _frame_ticks(vpts, 3003)))
+    a_frame = _frame_ticks(apts, 1920)
+    return (apid, (min(apts), max(apts), a_frame), (min(vpts), max(vpts), _frame_ticks(vpts, 3003)),
+            _last_audio_duration(ts, apid) or a_frame)
 
 
 _SILENT_ADTS = bytes.fromhex('fff14c8001bffc211004608c1c')   # one silent AAC-LC frame, 48 kHz stereo (ffmpeg's encoder)
@@ -805,7 +851,7 @@ class _MuxedChannel:
         (80 ms at the end of a break, 39 ms at its start), whole audio frames are dropped or silent ones added, see
         below: the decoder of the box doesn't cut an overlap or wait over a hole, so the sound is late or early from
         then on, a little more with every break."""
-        apid, (a_min, a_max, a_frame), (v_min, v_max, v_frame) = spans
+        apid, (a_min, a_max, a_frame), (v_min, v_max, v_frame), a_last = spans
         if not disc and self._v_end is not None:
             gap = _signed33(v_min + self._delta - self._v_end)
             if abs(gap) > _JUMP_TICKS:
@@ -845,7 +891,7 @@ class _MuxedChannel:
                          self.channel_id, seg.seq, 'hole of' if gap > 0 else 'overlaps the previous one by',
                          abs(gap) / 90, dropped, added, self._a_carry / 90)
         self._v_end = (v_max + self._delta + v_frame) & _PTS_MASK
-        self._a_end = (a_max + self._delta + a_frame) & _PTS_MASK
+        self._a_end = (a_max + self._delta + a_last) & _PTS_MASK
         self._expected = self._v_end
         return out
 
