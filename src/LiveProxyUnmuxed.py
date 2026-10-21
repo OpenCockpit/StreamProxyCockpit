@@ -3255,6 +3255,12 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             # code, so this just retries the same URL rather than branching
             # on the failure reason.
             time.sleep(_AUTO_MASTER_RETRY_DELAY)
+            if state.refresh_on_failure and _can_refresh(state):
+                # a provider that wants a new address after a failure gets to hand out another one each time (Pluto:
+                # another forwarded address, if the stitcher refuses the session of the one in use)
+                fresh_url = state.url_refresher()
+                if fresh_url:
+                    state.master_url = fresh_url
             text = _fetch(state.master_url, tag=f'handler:auto-master-retry{attempt + 1}', headers=state.headers)
         if not text:
             self._send(502, b'Bad gateway', 'text/plain')

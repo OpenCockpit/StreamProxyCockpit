@@ -365,6 +365,49 @@ def _stream_spans(ts: bytes) -> 'tuple | None':
     return (apid, (min(apts), max(apts), _frame_ticks(apts, 1920)), (min(vpts), max(vpts), _frame_ticks(vpts, 3003)))
 
 
+_SILENT_ADTS = bytes.fromhex('fff14c8001bffc211004608c1c')   # one silent AAC-LC frame, 48 kHz stereo (ffmpeg's encoder)
+_AUDIO_FILL_MAX = 25   # frames (0.53 s): more than this between two segments is not a join of the audio
+_AUDIO_SCAN_PACKETS = 2000   # packets of a segment searched for its first audio frame
+
+
+def _silent_audio_packet(apid: int, pts: int) -> bytes:
+    """One TS packet carrying a PES packet with the silent AAC frame, stamped *pts* (adaptation field as stuffing)."""
+    pes = bytearray((0x00, 0x00, 0x01, 0xC0, 0, 0, 0x84, 0x80, 0x05))
+    pes += bytes((0x21 | (((pts >> 30) & 7) << 1), (pts >> 22) & 0xFF, (((pts >> 15) & 0x7F) << 1) | 1,
+                  (pts >> 7) & 0xFF, ((pts & 0x7F) << 1) | 1))
+    pes += _SILENT_ADTS
+    length = len(pes) - 6
+    pes[4], pes[5] = length >> 8, length & 0xFF
+    stuffing = 184 - 1 - len(pes)
+    pkt = bytearray((0x47, 0x40 | (apid >> 8), apid & 0xFF, 0x30, stuffing))
+    pkt += bytes((0x00,)) + b'\xff' * (stuffing - 1)
+    pkt += pes
+    return bytes(pkt)
+
+
+def _first_audio_packet(ts: bytes, apid: int) -> 'int | None':
+    """Offset of the first packet of the audio PID in *ts* (the PES packet of its first frame starts there)."""
+    for off in range(0, min(len(ts) - 187, 188 * _AUDIO_SCAN_PACKETS), 188):
+        if ts[off] == 0x47 and ((ts[off + 1] & 0x1F) << 8 | ts[off + 2]) == apid and ts[off + 1] & 0x40:
+            return off
+    return None
+
+
+def _insert_silence(ts: bytes, apid: int, first_pts: int, frame_ticks: int, count: int) -> 'bytes | None':
+    """*ts* with *count* silent audio frames in front of its first audio frame, stamped from *first_pts* on. None if
+    the audio isn't the AAC-LC 48 kHz stereo the silent frame is (its first four ADTS header bytes)."""
+    off = _first_audio_packet(ts, apid)
+    if off is None:
+        return None
+    afc = (ts[off + 3] >> 4) & 3
+    pl = off + 4 + (1 + ts[off + 4] if afc & 2 else 0)
+    es = pl + 9 + ts[pl + 8]
+    if ts[es:es + 4] != _SILENT_ADTS[:4]:
+        return None
+    packets = b''.join(_silent_audio_packet(apid, (first_pts + i * frame_ticks) & _PTS_MASK) for i in range(count))
+    return ts[:off] + packets + ts[off:]
+
+
 def _drop_early_audio(ts: bytes, apid: int, limit: int) -> 'tuple[bytes, int]':
     """*ts* without the audio PES packets at its start whose PTS is before *limit* (their TS packets become null
     packets). Returns (data, number of PES packets dropped)."""
@@ -430,6 +473,7 @@ class _MuxedChannel:
         self._expected = None                         # PTS the next segment should start at
         self._a_end = None                            # PTS after the last audio frame sent, shifted
         self._v_end = None                            # the same for video
+        self._a_carry = 0                             # ticks the audio is off after the joins so far (+: a hole)
         self._lost = False                            # a segment was lost: treat the next one as a discontinuity
         self._warned_ffmpeg = False
         self._raw_layout = None        # PID layout of the first segment, served unchanged while the others match it
@@ -446,6 +490,7 @@ class _MuxedChannel:
             self._expected = inherit._expected
             self._a_end = inherit._a_end
             self._v_end = inherit._v_end
+            self._a_carry = inherit._a_carry
             self._lost = True
 
     # -- public --
@@ -745,6 +790,7 @@ class _MuxedChannel:
             ticks = int(seg.duration * 90000) if seg.duration > 0 else int(_DEFAULT_SEG_DURATION * 90000)
             self._expected = (first + self._delta + ticks) & _PTS_MASK
             self._a_end = self._v_end = None
+            self._a_carry = 0
             ts = _rewrite_timeline(ts, self._delta)
         ts, self._cc = _patch_continuity(ts, self._cc)
         return ts
@@ -755,9 +801,10 @@ class _MuxedChannel:
         At a discontinuity (tagged by the CDN, or a jump of more than a second that it didn't tag) the segment is
         shifted so that its video continues exactly where the video of the previous one ended; the audio keeps its
         place relative to the picture, as the source has it (an ad clip and the programme start their sound a different
-        time before their picture). Where that makes the audio overlap the end of the previous segment (80 ms at the
-        end of an ad break), the overlapping audio frames at its start are dropped: the decoder of the box doesn't cut
-        such an overlap, it plays the frames one after the other, and the sound is late from then on."""
+        time before their picture). Where the audio then overlaps the end of the previous segment or leaves a hole
+        (80 ms at the end of a break, 39 ms at its start), whole audio frames are dropped or silent ones added, see
+        below: the decoder of the box doesn't cut an overlap or wait over a hole, so the sound is late or early from
+        then on, a little more with every break."""
         apid, (a_min, a_max, a_frame), (v_min, v_max, v_frame) = spans
         if not disc and self._v_end is not None:
             gap = _signed33(v_min + self._delta - self._v_end)
@@ -771,11 +818,32 @@ class _MuxedChannel:
             self._delta = _signed33(self._v_end - v_min)
         out = _rewrite_timeline(ts, self._delta) if self._delta else ts
         if disc and self._a_end is not None:
-            overlap = _signed33(self._a_end - (a_min + self._delta))
-            if 0 < overlap <= _JUMP_TICKS:
-                out, dropped = _drop_early_audio(out, apid, self._a_end)
-                logger.debug('%s: segment %s: audio overlaps the previous one by %.0f ms | Action: %s audio frame(s) dropped',
-                             self.channel_id, seg.seq, overlap / 90, dropped)
+            # The decoder of the box plays the audio frames one after the other, whatever their timestamps say: a hole
+            # between two segments makes the sound early from then on, an overlap late. The CDN's clips don't join
+            # in whole frames (an ad loop overlaps its repeat by 37 ms, the end of a break by 80 ms), so the join is
+            # made in whole frames: drop the overlapping ones, add silent ones for a hole, and carry what is left
+            # over into the next join, so that the error stays within half a frame instead of adding up.
+            gap = _signed33(a_min + self._delta - self._a_end)   # > 0: a hole, < 0: an overlap
+            k = int(round(-(gap + self._a_carry) / a_frame))     # audio frames to drop (k > 0) or to add (k < 0)
+            added = dropped = 0
+            if abs(k) > _AUDIO_FILL_MAX:
+                self._a_carry = 0
+            else:
+                if k > 0:
+                    out, dropped = _drop_early_audio(out, apid, a_min + self._delta + k * a_frame - a_frame // 2)
+                elif k < 0:
+                    try:
+                        filled = _insert_silence(out, apid, self._a_end, a_frame, -k)
+                    except Exception as exc:   # the join of the audio must never stop the channel
+                        logger.debug('%s: segment %s: silent audio frames not added: %r', self.channel_id, seg.seq, exc)
+                        filled = None
+                    if filled is not None:
+                        out, added = filled, -k
+                self._a_carry += gap + (dropped - added) * a_frame
+            logger.debug('%s: segment %s: audio %s %.0f ms | Action: %s audio frame(s) dropped, %s silent one(s) added, '
+                         '%.0f ms carried',
+                         self.channel_id, seg.seq, 'hole of' if gap > 0 else 'overlaps the previous one by',
+                         abs(gap) / 90, dropped, added, self._a_carry / 90)
         self._v_end = (v_max + self._delta + v_frame) & _PTS_MASK
         self._a_end = (a_max + self._delta + a_frame) & _PTS_MASK
         self._expected = self._v_end
