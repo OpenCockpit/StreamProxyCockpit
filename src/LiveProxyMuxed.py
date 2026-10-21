@@ -48,7 +48,8 @@ _START_BACK_SEGMENTS = 3       # a channel starts at least this many segments be
 _START_BACK_SECONDS = 9.0      # ... and at least this much content: three 1s segments are no cushion against a CDN that stalls for 4-7s
 START_TIMEOUT = 25.0          # seconds until the first segment is ready (or the stream turns out to be unusable)
 _LIVE_DELAY_SECONDS = 12.0     # a starting player is not told about the newest segments worth this much content
-_MAX_HOLD = 4                  # ... but not more than this many segments
+_MAX_HOLD = 12                 # ... but not more than this many segments: 4 left a player that started on one second segments
+#                              # with 4s of cushion, the 6s segments that followed then ran it dry (CDN gap of 12.9s)
 _HOLD_WINDOW = 2.0             # ... for this many seconds after a player (re)starts: its first playlist(s) only
 _SESSION_GAP = 20.0            # a playlist request after this long without one starts a new playback session
 _PLAYLIST_SEGMENTS = 6         # segments advertised in the served playlist at least
