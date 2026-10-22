@@ -740,9 +740,11 @@ class _MuxedChannel:
                     last_stall_log = now
                     logger.debug('%s: nothing new in the playlist for %ss: seq %s..%s, waiting for %s',
                                  self.channel_id, int(now - last_progress), segments[0].seq, segments[-1].seq, next_seq)
-                if segments and segments[-1].seq < next_seq and now - last_progress > _RESYNC_AFTER:
+                if segments and segments[-1].seq < next_seq - 1 and now - last_progress > _RESYNC_AFTER:
                     # the media sequence went back (a new stream session or ad break numbers from a lower base):
-                    # every segment of the playlist is "old" for us and none would ever be fetched again
+                    # every segment of the playlist is "old" for us and none would ever be fetched again. A playlist
+                    # that just stopped growing ends with the segment we handled last (next_seq - 1): that is a CDN
+                    # stall, not a rewind, and following it "back" would replay the last few segments
                     next_seq = segments[max(0, len(segments) - _start_count(segments))].seq
                     self._lost = True
                     last_progress = now
