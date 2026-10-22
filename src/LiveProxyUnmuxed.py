@@ -276,10 +276,7 @@ _VOD_COLD_START_WAIT = 10.0    # VOD-only cold-start budget, replacing
 #                              # the single-segment live case that budget was tuned for.
 _TS_MASK = (1 << 33) - 1       # PTS/DTS/PCR-base are 33-bit fields with the same wraparound
 _LIVE_GAP_TICKS = 3000         # start of a window after the end of the previous one (90kHz ticks) until measured
-_LIVE_DISC_NOMINAL = True      # a transition leaves the hole the short last window left, like the recordings: see assign_live_delta
-_LIVE_DISC_HOLE_MAX = 135000   # ... but at most this much (1.5 s, what the recording that plays clean has): a hole of 4 s
-#                              # (the last movie window was 1 s long) distorted the first ad pictures again
-_MUX_ALIGN_MIN = 0.25          # seconds: _ffmpeg_mux shifts the audio to the start of the video window only for a
+_MUX_ALIGN_MIN = 0.25         # seconds: _ffmpeg_mux shifts the audio to the start of the video window only for a
 #                              # difference above this. The audio of a window starts at the first audio PES packet
 #                              # at or after the start of the video window (_RenditionBuffer.cut), so it is up to one
 #                              # packet late: 0.03-0.17 s for the audio description track of Hogan's Heroes, in every
@@ -532,7 +529,7 @@ class _RenditionBuffer:
         pts_list/off_list, which cut()'s slicing assumes.
         """
         if self.pts_list and pts_offsets and pts_offsets[0][1] < self.pts_list[-1]:
-            return
+            return False
         base = len(self.data)
         self.data += ts_bytes
         self.last_append_at = time.monotonic()
@@ -541,6 +538,7 @@ class _RenditionBuffer:
             self.off_list.append(base + off)
         if pat_pmt is not None:
             self.last_pat_pmt = pat_pmt
+        return True
 
     def cut(self, start_pts: int, end_pts: 'int | None'):
         """Return (sliced_bytes, actual_start_pts, actual_end_pts) covering
@@ -559,18 +557,16 @@ class _RenditionBuffer:
         if start_i >= len(self.pts_list):
             return None
         if end_pts is None:
-            # Always hold back the buffer's current last indexed entry
-            # rather than including it: the caller re-feeds this cut's own
-            # actual_end straight back in as the *next* call's start_pts
-            # (see _cut_and_mux_next_window), and bisect_left's inclusive
-            # semantics would re-match that exact same entry as the start
-            # of the next cut too - duplicating its bytes into both
-            # windows. Holding it back here means the next cut's start_i
-            # lands on this same not-yet-released entry, this time
-            # correctly picking up bytes from where this cut actually
-            # stopped (end_off below), not before it.
-            end_i = len(self.pts_list) - 2
-            if end_i < start_i:
+            # Everything buffered, the last entry too. It used to be held back so that the next window started
+            # on it, but the entries are in decode order: with B-frames the last one (a B-frame) comes after the
+            # entry with the highest pts, the next window then started with that one and the B-frame, and ffmpeg
+            # drops what precedes the first keyframe of a stream copy - the B-frame was lost, one picture per
+            # window (a hole in every 5 s of movie, and the picture before the ad dangling at a discontinuity).
+            # The next cut's start (the window's actual_end, see _cut_and_mux_next_window) still matches the
+            # entry with the highest pts again, and ffmpeg drops that duplicate (and the B-frame) in front of
+            # the keyframe the next segment starts with.
+            end_i = len(self.pts_list) - 1
+            if end_i <= start_i:
                 return None
         else:
             if self.pts_list[-1] < end_pts:
@@ -583,6 +579,9 @@ class _RenditionBuffer:
         chunk = bytes(self.data[start_off:end_off])
         if self.last_pat_pmt is not None:
             chunk = self.last_pat_pmt + chunk
+        if end_pts is None:
+            # decode order: the last entry need not carry the highest pts
+            return chunk, self.pts_list[start_i], max(self.pts_list[start_i:end_i + 1])
         return chunk, self.pts_list[start_i], self.pts_list[end_i]
 
     def trim_before(self, pts: int, retain_bytes: int = 0):
@@ -853,7 +852,7 @@ class _ChannelState:
                  '_video_prefetch_thread', '_video_prefetch_stop', '_lock', '_cc_state',
                  '_cc_resync_pending', '_last_playlist_out', '_last_segment_out',
                  '_pending_audio_floors', '_vod_complete', '_video_preload', '_video_first_playlist', '_audio_slice_end',
-                 '_live_delta', '_live_expected', '_live_prev_start', '_live_prev_end', '_live_gap',
+                 '_live_delta', '_live_expected', '_live_prev_end', '_live_gap',
                  '_window_delta', '_shift_cache')
 
     @property
@@ -971,7 +970,6 @@ class _ChannelState:
         # Timeline continuity for what is served to Enigma2, see assign_live_delta/timeline_adjusted.
         self._live_delta = 0             # shift (90kHz ticks, signed) the windows published from now on get
         self._live_expected = None       # where the next window should start, in shifted time
-        self._live_prev_start = None     # start PTS of the previous window as muxed (unshifted)
         self._live_prev_end = None       # end PTS of the previous window as muxed (unshifted)
         self._live_gap = _LIVE_GAP_TICKS  # measured distance between one window's end and the next one's start
         self._window_delta: dict = {}    # chunk_seq -> the shift of that window
@@ -1110,25 +1108,12 @@ class _ChannelState:
         """
         if not approximate:
             if is_disc and self._live_expected is not None:
-                expected = self._live_expected
-                if _LIVE_DISC_NOMINAL and self._live_prev_start is not None:
-                    # As in the recordings (RecordingSession): the next sequence starts one nominal window after the
-                    # start of the previous one, not right after its last picture. A short last window of the movie
-                    # (the CDN's last segment of a programme is often shorter) leaves a hole of that much, while the
-                    # movie's last picture stays on screen. The decoder is given the time to finish the movie and
-                    # set up for the new video sequence (another size, no B-frames): without the hole the first ad
-                    # pictures were mixed with the last movie picture for 2-3 s, with it the recordings play clean.
-                    nominal = (self._live_prev_start + self._live_delta + int(self.seg_duration * 90000)) & _TS_MASK
-                    ahead = (nominal - expected) & _TS_MASK
-                    if 0 < ahead < 5 * 90000:
-                        expected = (expected + min(ahead, _LIVE_DISC_HOLE_MAX)) & _TS_MASK
-                delta = (expected - start_pts) & _TS_MASK
+                delta = (self._live_expected - start_pts) & _TS_MASK
                 self._live_delta = delta - (1 << 33) if delta >= 1 << 32 else delta   # signed, 33-bit
             elif self._live_prev_end is not None:
                 gap = (start_pts - self._live_prev_end) & _TS_MASK
                 if 0 < gap < 90000:
                     self._live_gap = gap
-            self._live_prev_start = start_pts
             self._live_prev_end = end_pts
             self._live_expected = (end_pts + self._live_delta + self._live_gap) & _TS_MASK
         self._window_delta[seq] = self._live_delta
@@ -1139,7 +1124,6 @@ class _ChannelState:
         """Forget the timeline (the cached windows are dropped, see register_channel). Lock held by the caller."""
         self._live_delta = 0
         self._live_expected = None
-        self._live_prev_start = None
         self._live_prev_end = None
         self._live_gap = _LIVE_GAP_TICKS
         self._window_delta.clear()
@@ -1630,7 +1614,8 @@ def _append_audio(state: '_ChannelState', channel_id: str, seq: int, disc: bool,
         state._audio_appended_seqs = {
             s for s in state._audio_appended_seqs if s >= seq - _SEQ_REPROCESS_WINDOW
         }
-        if disc and seq not in state._audio_disc_seqs_seen:
+        new_epoch = disc and seq not in state._audio_disc_seqs_seen
+        if new_epoch:
             state._audio_epoch += 1
             for b in state._audio_bufs:
                 b.mark_closed()
@@ -1641,8 +1626,16 @@ def _append_audio(state: '_ChannelState', channel_id: str, seq: int, disc: bool,
         }
         if not state._audio_bufs:
             state._audio_bufs.insert(0, _RenditionBuffer(state._audio_epoch, is_disc_epoch=False))
-        state._audio_bufs[0].append(data, pts_offsets, pat_pmt)
+        taken = state._audio_bufs[0].append(data, pts_offsets, pat_pmt)
+        epoch = state._audio_bufs[0].epoch
+        video_epoch = state._video_epoch
         _prune_audio_bufs(state)
+    # Diagnostic: where the audio of a transition starts (compare with the video window's pts in the window cut
+    # log), and a segment the buffer refused (its pts below the buffer's tail), which would leave a silent hole.
+    if new_epoch or not taken:
+        logger.debug('%s/%s: Event: audio segment %s | epoch=%s (video_epoch=%s) first_pts=%s last_pts=%s',
+                     channel_id, seq, 'starts a new epoch' if taken else 'REJECTED by the buffer (pts goes backwards)',
+                     epoch, video_epoch, pts_offsets[0][1], pts_offsets[-1][1])
 
 
 def _slice_audio_for_window(state: '_ChannelState', epoch: int, start_pts: int, end_pts: int,
@@ -1943,9 +1936,9 @@ def _cut_and_mux_next_window(channel_id: str, state: '_ChannelState') -> bool:
                 state._cc_resync_pending = True
             return True
 
-    # Not actual_end: cut() deliberately holds back vbuf's own current last
-    # indexed entry (see its own comment) so the next cut's start_i lands on
-    # that still-unreleased entry instead of re-matching the one just cut.
+    # Not actual_end: the pts of the last entry (the lowest of those after the entry with the highest pts), so the
+    # next cut's bisect lands on that entry with the highest pts again - the windows' ranges touch ([a, b), [b, c))
+    # - see _RenditionBuffer.cut for what drops the repeated entries in front of the next segment's keyframe.
     state._video_cursor_pts = vbuf.pts_list[-1]
     vbuf.trim_before(actual_start, retain_bytes=_VIDEO_BUFFER_RETAIN_MARGIN_BYTES)
     return True
@@ -2350,6 +2343,12 @@ def _audio_prefetch_loop(channel_id: str, state: '_ChannelState'):
                          ' | Action: drop this segment, next poll will retry',
                          channel_id, seq, fail_reason)
 
+        disc_seqs = [t[0] for t in to_fetch if t[4]]
+        if disc_seqs:
+            logger.debug('%s: Event: audio poll fetches seqs %s-%s, discontinuity before seq %s (aseq_base=%s,'
+                         ' audio_epoch=%s, video_epoch=%s)',
+                         channel_id, to_fetch[0][0], to_fetch[-1][0], disc_seqs, aseq_base,
+                         state.current_audio_epoch(), state.current_video_epoch())
         workers = min(_AUDIO_FETCH_WORKERS, len(to_fetch))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for seq, url, k, iv, _disc in to_fetch:
@@ -3275,6 +3274,12 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             self._send(404, b'Unknown channel', 'text/plain')
             return
         resolved_master_url(state)
+        if state.url_refresher and _has_empty_jwt(state.master_url):
+            # Cold slot: the channel was registered before a token was available and the stitcher would only refuse
+            # this address (401). Get the token first instead of fetching once for nothing.
+            fresh_url = state.url_refresher()
+            if fresh_url:
+                state.master_url = fresh_url
         text = _fetch(state.master_url, tag='handler:auto-master', headers=state.headers)
         if not text and _can_refresh(state):
             # Cold-slot miss: JWT was empty when the channel was registered
