@@ -276,6 +276,9 @@ _VOD_COLD_START_WAIT = 10.0    # VOD-only cold-start budget, replacing
 #                              # the single-segment live case that budget was tuned for.
 _TS_MASK = (1 << 33) - 1       # PTS/DTS/PCR-base are 33-bit fields with the same wraparound
 _LIVE_GAP_TICKS = 3000         # start of a window after the end of the previous one (90kHz ticks) until measured
+_LIVE_DISC_NOMINAL = True      # a transition leaves the hole the short last window left, like the recordings: see assign_live_delta
+_LIVE_DISC_HOLE_MAX = 135000   # ... but at most this much (1.5 s, what the recording that plays clean has): a hole of 4 s
+#                              # (the last movie window was 1 s long) distorted the first ad pictures again
 _MUX_ALIGN_MIN = 0.25          # seconds: _ffmpeg_mux shifts the audio to the start of the video window only for a
 #                              # difference above this. The audio of a window starts at the first audio PES packet
 #                              # at or after the start of the video window (_RenditionBuffer.cut), so it is up to one
@@ -850,7 +853,7 @@ class _ChannelState:
                  '_video_prefetch_thread', '_video_prefetch_stop', '_lock', '_cc_state',
                  '_cc_resync_pending', '_last_playlist_out', '_last_segment_out',
                  '_pending_audio_floors', '_vod_complete', '_video_preload', '_video_first_playlist', '_audio_slice_end',
-                 '_live_delta', '_live_expected', '_live_prev_end', '_live_gap',
+                 '_live_delta', '_live_expected', '_live_prev_start', '_live_prev_end', '_live_gap',
                  '_window_delta', '_shift_cache')
 
     @property
@@ -968,6 +971,7 @@ class _ChannelState:
         # Timeline continuity for what is served to Enigma2, see assign_live_delta/timeline_adjusted.
         self._live_delta = 0             # shift (90kHz ticks, signed) the windows published from now on get
         self._live_expected = None       # where the next window should start, in shifted time
+        self._live_prev_start = None     # start PTS of the previous window as muxed (unshifted)
         self._live_prev_end = None       # end PTS of the previous window as muxed (unshifted)
         self._live_gap = _LIVE_GAP_TICKS  # measured distance between one window's end and the next one's start
         self._window_delta: dict = {}    # chunk_seq -> the shift of that window
@@ -1106,12 +1110,25 @@ class _ChannelState:
         """
         if not approximate:
             if is_disc and self._live_expected is not None:
-                delta = (self._live_expected - start_pts) & _TS_MASK
+                expected = self._live_expected
+                if _LIVE_DISC_NOMINAL and self._live_prev_start is not None:
+                    # As in the recordings (RecordingSession): the next sequence starts one nominal window after the
+                    # start of the previous one, not right after its last picture. A short last window of the movie
+                    # (the CDN's last segment of a programme is often shorter) leaves a hole of that much, while the
+                    # movie's last picture stays on screen. The decoder is given the time to finish the movie and
+                    # set up for the new video sequence (another size, no B-frames): without the hole the first ad
+                    # pictures were mixed with the last movie picture for 2-3 s, with it the recordings play clean.
+                    nominal = (self._live_prev_start + self._live_delta + int(self.seg_duration * 90000)) & _TS_MASK
+                    ahead = (nominal - expected) & _TS_MASK
+                    if 0 < ahead < 5 * 90000:
+                        expected = (expected + min(ahead, _LIVE_DISC_HOLE_MAX)) & _TS_MASK
+                delta = (expected - start_pts) & _TS_MASK
                 self._live_delta = delta - (1 << 33) if delta >= 1 << 32 else delta   # signed, 33-bit
             elif self._live_prev_end is not None:
                 gap = (start_pts - self._live_prev_end) & _TS_MASK
                 if 0 < gap < 90000:
                     self._live_gap = gap
+            self._live_prev_start = start_pts
             self._live_prev_end = end_pts
             self._live_expected = (end_pts + self._live_delta + self._live_gap) & _TS_MASK
         self._window_delta[seq] = self._live_delta
@@ -1122,6 +1139,7 @@ class _ChannelState:
         """Forget the timeline (the cached windows are dropped, see register_channel). Lock held by the caller."""
         self._live_delta = 0
         self._live_expected = None
+        self._live_prev_start = None
         self._live_prev_end = None
         self._live_gap = _LIVE_GAP_TICKS
         self._window_delta.clear()
@@ -1489,6 +1507,7 @@ def _ensure_pipeline(channel_id: str, state: '_ChannelState') -> bool:
     audio_candidates = []
     variant_urls = []
     lines = text.splitlines()
+    best = _best_variant_line(lines)
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -1502,7 +1521,8 @@ def _ensure_pipeline(channel_id: str, state: '_ChannelState') -> bool:
         if line.startswith('#EXT-X-STREAM-INF:'):
             i += 1
             if i < len(lines):
-                variant_urls.append(urljoin(master_base, lines[i]))
+                if i - 1 == best:
+                    variant_urls.append(urljoin(master_base, lines[i]))
                 i += 1
             continue
         i += 1
@@ -3075,6 +3095,26 @@ class _FetchedText(str):
     url = ''
 
 
+def _best_variant_line(lines: 'list[str]') -> int:
+    """Index in *lines* of the #EXT-X-STREAM-INF line of the variant with the highest bandwidth, -1 if there is none.
+
+    The proxy muxes one video rendition per channel that everyone who plays or records it shares. Which one it was
+    used to depend on whichever client asked for a playlist first: a recording starts the pipeline with the first
+    variant of the master playlist, and a recording pipeline has no connection speed set, so it asks for the lowest.
+    A live viewer who wanted the highest then got the 640x360 one. The proxy chooses, and offers only that one."""
+    best = -1
+    best_bandwidth = -1
+    for i, line in enumerate(lines):
+        if line.startswith('#EXT-X-STREAM-INF:'):
+            try:
+                bandwidth = int(HLSPlaylist.attr_value('BANDWIDTH', line) or 0)
+            except ValueError:
+                bandwidth = 0
+            if bandwidth > best_bandwidth:
+                best, best_bandwidth = i, bandwidth
+    return best
+
+
 def _base_url(text, requested_url: str) -> str:
     """The directory address relative addresses in the playlist *text* are relative to (the query string is no
     part of it): where it was finally fetched from, *requested_url* if that isn't known."""
@@ -3299,6 +3339,7 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
         audio_candidates = []
         lines = text.splitlines()
         logger.debug('%s: master playlist fetched, %s lines', channel_id, len(lines))
+        best = _best_variant_line(lines)   # the only variant offered, see _best_variant_line
         i = 0
         while i < len(lines):
             line = lines[i]
@@ -3316,6 +3357,10 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                     if cand:
                         audio_candidates.append(cand)
                 i += 1
+                continue
+
+            if line.startswith('#EXT-X-STREAM-INF:') and i != best:
+                i += 2   # the line and its address: this variant isn't offered
                 continue
 
             if line.startswith('#EXT-X-STREAM-INF:'):
