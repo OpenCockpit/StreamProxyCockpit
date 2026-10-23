@@ -129,7 +129,7 @@ def _resolve(sref):
     try:
         url = _providers[scheme](channel_id, sref)
     except Exception as exc:
-        logger.error("%s can't resolve %s: %s", scheme, channel_id, exc)
+        logger.error("%s can't resolve %s: %s", scheme, channel_id, LiveProxyUnmuxed._redact(exc))
         return sref, None
     if not url:
         return sref, None

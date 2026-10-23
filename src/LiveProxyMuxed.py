@@ -41,7 +41,7 @@ from urllib.parse import urljoin
 from .AES128 import AES128
 from .Debug import logger
 from .HLSParser import HLSPlaylist
-from .LiveProxyUnmuxed import PROXY_HOST, PROXY_PORT, _FFMPEG, _FFMPEG_TIMEOUT, _fetch, _first_pts, _patch_continuity, resolved_master_url
+from .LiveProxyUnmuxed import PROXY_HOST, PROXY_PORT, _FFMPEG, _FFMPEG_TIMEOUT, _fetch, _first_pts, _patch_continuity, _redact, resolved_master_url
 from .RecordingProxyUnmuxed import _PTS_MASK, _rewrite_timeline, _segment_is_disc
 
 _START_BACK_SEGMENTS = 3       # a channel starts at least this many segments before the live edge (hlsdemux does too)
@@ -638,7 +638,7 @@ class _MuxedChannel:
         try:
             self._loop()
         except Exception as exc:  # pylint: disable=broad-except
-            logger.debug('%s: muxed poller failed: %s', self.channel_id, exc)
+            logger.debug('%s: muxed poller failed: %s', self.channel_id, _redact(exc))
             self._set_status('error', str(exc))
         finally:
             with self.cond:

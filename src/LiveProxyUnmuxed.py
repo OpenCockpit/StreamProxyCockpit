@@ -8,6 +8,7 @@
 
 import bisect
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -208,13 +209,6 @@ _HANDLE_SEGMENT_DEADLINE_FACTOR = 1.0  # _handle_segment's provisional-wait dead
 #                              # spending live-window real time. Capped to roughly one
 #                              # segment's worth so a stuck segment can cost at most ~1
 #                              # segment of the live window, not several.
-_SLATE_WINDOW_BYTES = 200000   # a live channel whose first window is smaller than this (the 60-70 KB slate a new Pluto
-#                              # stitch session starts with: 4.8 s of an almost static picture) is not started with
-#                              # that window alone: _handle_playlist waits for a second one (_SLATE_WAIT). Given only
-#                              # the slate, hlsdemux doesn't go on to preroll but asks for the playlist again after a
-#                              # target duration (5 s); with the next window in the first playlist the start was
-#                              # about 4 s sooner.
-_SLATE_WAIT = 3.0              # seconds to wait for that second window
 _COLD_START_FIRST_SEGMENT_WAIT = 5.0  # seconds _handle_playlist waits, on a channel's
 #                              # very first playlist request only, for segment 0 to
 #                              # actually be ready before replying at all. Observed in
@@ -276,25 +270,6 @@ _VOD_COLD_START_WAIT = 10.0    # VOD-only cold-start budget, replacing
 #                              # the single-segment live case that budget was tuned for.
 _TS_MASK = (1 << 33) - 1       # PTS/DTS/PCR-base are 33-bit fields with the same wraparound
 _LIVE_GAP_TICKS = 3000         # start of a window after the end of the previous one (90kHz ticks) until measured
-_MUX_ALIGN_MIN = 0.25         # seconds: _ffmpeg_mux shifts the audio to the start of the video window only for a
-#                              # difference above this. The audio of a window starts at the first audio PES packet
-#                              # at or after the start of the video window (_RenditionBuffer.cut), so it is up to one
-#                              # packet late: 0.03-0.17 s for the audio description track of Hogan's Heroes, in every
-#                              # window. Moving that audio back to the start of the window put it ahead of the
-#                              # picture by that much, a different amount in every window (audible as audio and
-#                              # video slightly out of sync). The audio is contiguous from window to window, so
-#                              # with its own timestamps it is where it belongs.
-_STALE_AUDIO_DELAY = 3.0       # seconds _slice_audio_for_window waits for the audio of a window's own epoch before it
-#                              # falls back on the one of the epoch before. After a content transition the audio
-#                              # rendition can be a segment behind the video one; the old epoch's buffer then still
-#                              # holds the PREVIOUS clip at the same (restarted) timestamps, and a window of the new
-#                              # clip used its audio at once (an ad's sound under a few seconds of a movie).
-_STALE_COVER_SLACK = 45000     # 90 kHz ticks (0.5 s): audio of the epoch before only counts as covering a window if its
-#                              # first and last packet are this close to the window's start and end. Such a buffer is
-#                              # usually consumed up to its end already, and cut() then returns the few packets that
-#                              # are left (3 packets for a 5 s window, shifted back by 5 s): a window without sound.
-_AUDIO_JOIN_MAX_GAP = 45000    # 90 kHz ticks (0.5 s): the audio of a window continues where the previous one ended
-#                              # if the video window starts at most this long after that point (_cut_and_mux_next_window)
 _FFMPEG_TIMEOUT = 30           # seconds; _ffmpeg_mux is a stream-copy (no transcode),
 #                              # so its runtime is dominated by fixed process-spawn +
 #                              # temp-file I/O overhead, not segment playback duration
@@ -529,7 +504,7 @@ class _RenditionBuffer:
         pts_list/off_list, which cut()'s slicing assumes.
         """
         if self.pts_list and pts_offsets and pts_offsets[0][1] < self.pts_list[-1]:
-            return False
+            return
         base = len(self.data)
         self.data += ts_bytes
         self.last_append_at = time.monotonic()
@@ -538,7 +513,6 @@ class _RenditionBuffer:
             self.off_list.append(base + off)
         if pat_pmt is not None:
             self.last_pat_pmt = pat_pmt
-        return True
 
     def cut(self, start_pts: int, end_pts: 'int | None'):
         """Return (sliced_bytes, actual_start_pts, actual_end_pts) covering
@@ -557,16 +531,18 @@ class _RenditionBuffer:
         if start_i >= len(self.pts_list):
             return None
         if end_pts is None:
-            # Everything buffered, the last entry too. It used to be held back so that the next window started
-            # on it, but the entries are in decode order: with B-frames the last one (a B-frame) comes after the
-            # entry with the highest pts, the next window then started with that one and the B-frame, and ffmpeg
-            # drops what precedes the first keyframe of a stream copy - the B-frame was lost, one picture per
-            # window (a hole in every 5 s of movie, and the picture before the ad dangling at a discontinuity).
-            # The next cut's start (the window's actual_end, see _cut_and_mux_next_window) still matches the
-            # entry with the highest pts again, and ffmpeg drops that duplicate (and the B-frame) in front of
-            # the keyframe the next segment starts with.
-            end_i = len(self.pts_list) - 1
-            if end_i <= start_i:
+            # Always hold back the buffer's current last indexed entry
+            # rather than including it: the caller re-feeds this cut's own
+            # actual_end straight back in as the *next* call's start_pts
+            # (see _cut_and_mux_next_window), and bisect_left's inclusive
+            # semantics would re-match that exact same entry as the start
+            # of the next cut too - duplicating its bytes into both
+            # windows. Holding it back here means the next cut's start_i
+            # lands on this same not-yet-released entry, this time
+            # correctly picking up bytes from where this cut actually
+            # stopped (end_off below), not before it.
+            end_i = len(self.pts_list) - 2
+            if end_i < start_i:
                 return None
         else:
             if self.pts_list[-1] < end_pts:
@@ -579,9 +555,6 @@ class _RenditionBuffer:
         chunk = bytes(self.data[start_off:end_off])
         if self.last_pat_pmt is not None:
             chunk = self.last_pat_pmt + chunk
-        if end_pts is None:
-            # decode order: the last entry need not carry the highest pts
-            return chunk, self.pts_list[start_i], max(self.pts_list[start_i:end_i + 1])
         return chunk, self.pts_list[start_i], self.pts_list[end_i]
 
     def trim_before(self, pts: int, retain_bytes: int = 0):
@@ -732,10 +705,8 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
         if v_pts is not None and a_pts is not None:
             itsoffset = (v_pts - a_pts) / 90000.0
             if abs(itsoffset) > 0.020:
-                logger.debug('_ffmpeg_mux: pts v=%s a=%s itsoffset=%.3fs%s',
-                             v_pts, a_pts, itsoffset, ' (not applied)' if abs(itsoffset) <= _MUX_ALIGN_MIN else '')
-            if abs(itsoffset) <= _MUX_ALIGN_MIN:
-                itsoffset = 0.0   # the audio packet boundary, not a misalignment of the two renditions
+                logger.debug('_ffmpeg_mux: pts v=%s a=%s itsoffset=%.3fs',
+                             v_pts, a_pts, itsoffset)
         else:
             logger.debug('_ffmpeg_mux: _first_pts failed v=%s a=%s', v_pts, a_pts)
         if state is not None and state.audio_format is None:
@@ -745,10 +716,6 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
 
     mpegts_flags = 'initial_discontinuity' if is_disc else ''
 
-    # -pes_payload_size 0: one PES packet (with its own PTS) per audio frame, as Pluto's own segments have. The muxer's
-    # default packs about 11 frames (235 ms) into one PES packet with a single PTS; the Dreambox's audio decoder then
-    # played the audio at a different offset from the picture than it does for the original stream (direct playback
-    # without the proxy is in sync).
     if audio_data:
         cmd = [_FFMPEG, '-y', '-loglevel', 'error',
                '-probesize', '200000', '-analyzeduration', '1000000',
@@ -758,7 +725,7 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
                '-i', afile,
                '-c', 'copy',
                '-map', '0:v:0', '-map', '1:a:0',
-               '-f', 'mpegts', '-copyts', '-pes_payload_size', '0']
+               '-f', 'mpegts', '-copyts']
         if mpegts_flags:
             cmd += ['-mpegts_flags', mpegts_flags]
         cmd += ['-pat_period', '2', 'pipe:1']
@@ -791,7 +758,7 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
                '-c:v', 'copy', '-c:a', 'aac', '-b:a', '64k',
                '-map', '0:v:0', '-map', '1:a:0',
                '-shortest',
-               '-f', 'mpegts', '-copyts', '-pes_payload_size', '0']
+               '-f', 'mpegts', '-copyts']
         if mpegts_flags:
             cmd += ['-mpegts_flags', mpegts_flags]
         cmd += ['-pat_period', '2', 'pipe:1']
@@ -800,7 +767,7 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
         cmd = [_FFMPEG, '-y', '-loglevel', 'error',
                '-probesize', '200000', '-analyzeduration', '1000000',
                '-i', vfile,
-               '-c', 'copy', '-f', 'mpegts', '-copyts', '-pes_payload_size', '0']
+               '-c', 'copy', '-f', 'mpegts', '-copyts']
         if mpegts_flags:
             cmd += ['-mpegts_flags', mpegts_flags]
         cmd += ['-pat_period', '2', 'pipe:1']
@@ -851,7 +818,7 @@ class _ChannelState:
                  '_audio_prefetch_thread', '_audio_prefetch_stop',
                  '_video_prefetch_thread', '_video_prefetch_stop', '_lock', '_cc_state',
                  '_cc_resync_pending', '_last_playlist_out', '_last_segment_out',
-                 '_pending_audio_floors', '_vod_complete', '_video_preload', '_video_first_playlist', '_audio_slice_end',
+                 '_pending_audio_floors', '_vod_complete', '_video_preload', '_video_first_playlist',
                  '_live_delta', '_live_expected', '_live_prev_end', '_live_gap',
                  '_window_delta', '_shift_cache')
 
@@ -976,8 +943,6 @@ class _ChannelState:
         self._shift_cache: dict = {}     # chunk_seq -> (muxed bytes, shifted bytes) of the latest served
         self._video_preload: 'dict[str, Future]' = {}   # VOD start only: video segment url -> its download, started
         #                                 # by _handle_playlist while the audio is still being fetched
-        self._audio_slice_end: 'tuple[int, int] | None' = None   # live: (epoch, end pts) of the audio range the previous
-        #                                 # window was given, where the next window's audio range continues
         self._video_first_playlist: 'tuple[str, str] | None' = None   # VOD start only: (url, text) of the video
         #                                 # playlist _handle_playlist just fetched, for the video loop's first poll
         self._vod_complete = False       # VOD only: every segment of the asset has been fetched
@@ -1074,11 +1039,6 @@ class _ChannelState:
         """
         with self._lock:
             return bool(self._ready_segs)
-
-    def first_ready_size(self) -> int:
-        """Size in bytes of the oldest produced segment, 0 if there is none."""
-        with self._lock:
-            return len(next(iter(self._ready_segs.values()))) if self._ready_segs else 0
 
     def ready_seg_count(self) -> int:
         """Thread-safe count of currently-produced segments.
@@ -1484,7 +1444,11 @@ def _ensure_pipeline(channel_id: str, state: '_ChannelState') -> bool:
     if not text:
         return False
 
-    if not HLSPlaylist.needs_audio_mux(text):
+    needs_mux = any(
+        line.startswith('#EXT-X-MEDIA:') and 'TYPE=AUDIO' in line
+        for line in text.splitlines()
+    )
+    if not needs_mux:
         return False
 
     master_base = _base_url(text, state.master_url)
@@ -1614,8 +1578,7 @@ def _append_audio(state: '_ChannelState', channel_id: str, seq: int, disc: bool,
         state._audio_appended_seqs = {
             s for s in state._audio_appended_seqs if s >= seq - _SEQ_REPROCESS_WINDOW
         }
-        new_epoch = disc and seq not in state._audio_disc_seqs_seen
-        if new_epoch:
+        if disc and seq not in state._audio_disc_seqs_seen:
             state._audio_epoch += 1
             for b in state._audio_bufs:
                 b.mark_closed()
@@ -1626,16 +1589,8 @@ def _append_audio(state: '_ChannelState', channel_id: str, seq: int, disc: bool,
         }
         if not state._audio_bufs:
             state._audio_bufs.insert(0, _RenditionBuffer(state._audio_epoch, is_disc_epoch=False))
-        taken = state._audio_bufs[0].append(data, pts_offsets, pat_pmt)
-        epoch = state._audio_bufs[0].epoch
-        video_epoch = state._video_epoch
+        state._audio_bufs[0].append(data, pts_offsets, pat_pmt)
         _prune_audio_bufs(state)
-    # Diagnostic: where the audio of a transition starts (compare with the video window's pts in the window cut
-    # log), and a segment the buffer refused (its pts below the buffer's tail), which would leave a silent hole.
-    if new_epoch or not taken:
-        logger.debug('%s/%s: Event: audio segment %s | epoch=%s (video_epoch=%s) first_pts=%s last_pts=%s',
-                     channel_id, seq, 'starts a new epoch' if taken else 'REJECTED by the buffer (pts goes backwards)',
-                     epoch, video_epoch, pts_offsets[0][1], pts_offsets[-1][1])
 
 
 def _slice_audio_for_window(state: '_ChannelState', epoch: int, start_pts: int, end_pts: int,
@@ -1670,19 +1625,14 @@ def _slice_audio_for_window(state: '_ChannelState', epoch: int, start_pts: int, 
     if wait_secs is None:
         wait_secs = state.seg_duration * 1.6
     deadline = time.monotonic() + wait_secs
-    stale_ok_at = time.monotonic() + min(_STALE_AUDIO_DELAY, wait_secs / 2)
     snapshot = ''   # last-seen state of every held buffer, for the miss log below
-    audio_moved_on = False
     while True:
         with state._lock:
             candidates = [b for b in state._audio_bufs if b.epoch == epoch]
-            if not is_disc_window and time.monotonic() >= stale_ok_at:
+            if not is_disc_window:
                 candidates += [b for b in state._audio_bufs if b.epoch == epoch - 1]
             for b in candidates:
                 cut = b.cut(start_pts, end_pts)
-                if cut is not None and b.epoch != epoch and (cut[1] - start_pts > _STALE_COVER_SLACK
-                                                             or end_pts - cut[2] > _STALE_COVER_SLACK):
-                    cut = None
                 if cut is not None:
                     data, a_start, _a_end = cut
                     b.trim_before(state.audio_trim_floor(b.epoch, a_start))
@@ -1705,19 +1655,12 @@ def _slice_audio_for_window(state: '_ChannelState', epoch: int, start_pts: int, 
                 if b.pts_list else f'epoch={b.epoch} empty'
                 for b in state._audio_bufs
             ) or 'no buffers held'
-            # The audio rendition went through a transition the video one hasn't flagged (yet, or ever): every
-            # buffer this window could draw on is closed and a later epoch exists. A closed buffer is never
-            # extended, so waiting for the rest of wait_secs cannot produce this window's audio.
-            audio_moved_on = (bool(candidates) and all(b.closed_at is not None for b in candidates)
-                              and any(b.epoch > epoch for b in state._audio_bufs))
-        if audio_moved_on or time.monotonic() >= deadline:
+        if time.monotonic() >= deadline:
             if channel_id:
                 logger.debug('%s/%s: audio MISS window epoch=%s pts=[%s,%s) waited=%.2fs'
-                             ' is_disc_window=%s%s buffers=[%s]',
-                             channel_id, chunk_seq, epoch, start_pts, end_pts,
-                             wait_secs - max(0.0, deadline - time.monotonic()),
-                             is_disc_window, ' (audio already moved on to a later epoch)' if audio_moved_on else '',
-                             snapshot)
+                             ' is_disc_window=%s buffers=[%s]',
+                             channel_id, chunk_seq, epoch, start_pts, end_pts, wait_secs,
+                             is_disc_window, snapshot)
             return None, None, False
         if state._audio_prefetch_stop.wait(timeout=0.1):
             return None, None, False   # channel closed: the audio will never arrive, don't hold close() up
@@ -1830,21 +1773,8 @@ def _cut_and_mux_next_window(channel_id: str, state: '_ChannelState') -> bool:
     is_disc = vbuf.is_disc_epoch and not vbuf.first_window_emitted
     vbuf.first_window_emitted = True
 
-    # The audio of consecutive windows has to join up: a window's audio range ends at the pts of its last video
-    # entry, and the next one used to start at the pts of its first, a little later (21-40 ms). The audio packets
-    # (several frames each) that start in that gap were in neither window: about 16 ms of audio lost per window on
-    # average (Hogan's Heroes: 4.984 s of audio per 5 s window). Enigma2 plays audio on without regard to such small
-    # holes in the timestamps, so the audio ran ahead of the picture, a little more with every window, until the
-    # next discontinuity made it synchronise again. Continue where the previous window's audio ended instead.
-    a_start = actual_start
-    prev_end = state._audio_slice_end
-    if (not is_disc and prev_end is not None and prev_end[0] == vbuf.epoch
-            and 0 < actual_start - prev_end[1] <= _AUDIO_JOIN_MAX_GAP):
-        a_start = prev_end[1]
-    state._audio_slice_end = (vbuf.epoch, actual_end)
-
     aslice, a_pts, covered = _slice_audio_for_window(
-        state, vbuf.epoch, a_start, actual_end, is_disc_window=is_disc,
+        state, vbuf.epoch, actual_start, actual_end, is_disc_window=is_disc,
         wait_secs=(_DISC_AUDIO_PEEK_WAIT if is_disc else None),
         channel_id=channel_id)
 
@@ -1881,10 +1811,10 @@ def _cut_and_mux_next_window(channel_id: str, state: '_ChannelState') -> bool:
         # see add_pending_audio_floor's own comment for why that gap would
         # matter (a concurrent trim landing between "published uncovered"
         # and "retry thread actually running" would slip through otherwise).
-        state.add_pending_audio_floor(vbuf.epoch, a_start)
+        state.add_pending_audio_floor(vbuf.epoch, actual_start)
         threading.Thread(
             target=_resolve_late_audio_window,
-            args=(channel_id, state, chunk_seq, vslice, vbuf.epoch, a_start, actual_end, is_disc),
+            args=(channel_id, state, chunk_seq, vslice, vbuf.epoch, actual_start, actual_end, is_disc),
             daemon=True,
             name=f'LateAudio-{channel_id[:8]}-{chunk_seq}',
         ).start()
@@ -1936,9 +1866,9 @@ def _cut_and_mux_next_window(channel_id: str, state: '_ChannelState') -> bool:
                 state._cc_resync_pending = True
             return True
 
-    # Not actual_end: the pts of the last entry (the lowest of those after the entry with the highest pts), so the
-    # next cut's bisect lands on that entry with the highest pts again - the windows' ranges touch ([a, b), [b, c))
-    # - see _RenditionBuffer.cut for what drops the repeated entries in front of the next segment's keyframe.
+    # Not actual_end: cut() deliberately holds back vbuf's own current last
+    # indexed entry (see its own comment) so the next cut's start_i lands on
+    # that still-unreleased entry instead of re-matching the one just cut.
     state._video_cursor_pts = vbuf.pts_list[-1]
     vbuf.trim_before(actual_start, retain_bytes=_VIDEO_BUFFER_RETAIN_MARGIN_BYTES)
     return True
@@ -2165,7 +2095,7 @@ def _audio_prefetch_loop(channel_id: str, state: '_ChannelState'):
             aseq_base, asegs = HLSPlaylist.segments(atext, abase)
             audio_key_urls, audio_ivs, audio_discs = HLSPlaylist.segment_keys(atext, abase)
         except Exception as exc:
-            logger.debug('%s: audio playlist parse error: %s', channel_id, exc)
+            logger.debug('%s: audio playlist parse error: %s', channel_id, _redact(exc))
             continue
 
         # See the matching call in _video_prefetch_loop: anchors the pacing
@@ -2343,12 +2273,6 @@ def _audio_prefetch_loop(channel_id: str, state: '_ChannelState'):
                          ' | Action: drop this segment, next poll will retry',
                          channel_id, seq, fail_reason)
 
-        disc_seqs = [t[0] for t in to_fetch if t[4]]
-        if disc_seqs:
-            logger.debug('%s: Event: audio poll fetches seqs %s-%s, discontinuity before seq %s (aseq_base=%s,'
-                         ' audio_epoch=%s, video_epoch=%s)',
-                         channel_id, to_fetch[0][0], to_fetch[-1][0], disc_seqs, aseq_base,
-                         state.current_audio_epoch(), state.current_video_epoch())
         workers = min(_AUDIO_FETCH_WORKERS, len(to_fetch))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for seq, url, k, iv, _disc in to_fetch:
@@ -3085,15 +3009,6 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
-class _FetchedText(str):
-    """The text of a playlist, with the address it was fetched from in .url: after the redirects of the request.
-
-    Relative addresses in a playlist are relative to that one, not to the address that was asked for: the master
-    playlist of a channel can be behind a redirect to another host (a playout host that redirects to
-    an ad-insertion service), and its variants are then found there and nowhere on the host of the redirecting address."""
-    url = ''
-
-
 def _best_variant_line(lines: 'list[str]') -> int:
     """Index in *lines* of the #EXT-X-STREAM-INF line of the variant with the highest bandwidth, -1 if there is none.
 
@@ -3114,6 +3029,15 @@ def _best_variant_line(lines: 'list[str]') -> int:
     return best
 
 
+class _FetchedText(str):
+    """The text of a playlist, with the address it was fetched from in .url: after the redirects of the request.
+
+    Relative addresses in a playlist are relative to that one, not to the address that was asked for: the master
+    playlist of a channel can be behind a redirect to another host (a playout host that redirects to
+    an ad-insertion service), and its variants are then found there and nowhere on the host of the redirecting address."""
+    url = ''
+
+
 def _base_url(text, requested_url: str) -> str:
     """The directory address relative addresses in the playlist *text* are relative to (the query string is no
     part of it): where it was finally fetched from, *requested_url* if that isn't known."""
@@ -3126,6 +3050,16 @@ def _background(func, *args, **kwargs) -> Future:
     future = pool.submit(func, *args, **kwargs)
     pool.shutdown(wait=False)   # the worker ends with the call
     return future
+
+
+_JWT_RE = re.compile(r"(?i)(jwt=)[^&\s'\")]+")
+
+
+def _redact(value) -> str:
+    """*value* as text with the value of every jwt= (the token of the stream provider's session: it names the client
+    address, city and coordinates and stays valid for a day) replaced, for the log: a fetch error prints the address
+    it asked for, and so does the text of the exception."""
+    return _JWT_RE.sub(r'\1<redacted>', str(value))
 
 
 def _fetch(url: str, binary: bool = False, timeout: int = 6, tag: str = '', headers: 'dict | None' = None):
@@ -3160,7 +3094,7 @@ def _fetch(url: str, binary: bool = False, timeout: int = 6, tag: str = '', head
         return text
     except Exception as exc:
         label = f' [{tag}]' if tag else ''
-        logger.debug('fetch error%s %r: %s', label, url, exc)
+        logger.debug('fetch error%s %s: %s', label, _redact(repr(url)), _redact(exc))
         return None
 
 
@@ -3193,7 +3127,7 @@ def resolved_master_url(state: '_ChannelState') -> str:
                 try:
                     url = state.url_refresher()
                 except Exception as exc:
-                    logger.debug('url_refresher failed: %s', exc)
+                    logger.debug('url_refresher failed: %s', _redact(exc))
                     url = None
                 if url:
                     state.master_url = url
@@ -3257,7 +3191,7 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass  # client disconnected before response was fully sent – normal on zap
         except Exception as exc:
-            logger.debug('handler error: %s', exc)
+            logger.debug('handler error: %s', _redact(exc))
             try:
                 self._send(500, b'Internal error', 'text/plain')
             except OSError:
@@ -3274,12 +3208,6 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             self._send(404, b'Unknown channel', 'text/plain')
             return
         resolved_master_url(state)
-        if state.url_refresher and _has_empty_jwt(state.master_url):
-            # Cold slot: the channel was registered before a token was available and the stitcher would only refuse
-            # this address (401). Get the token first instead of fetching once for nothing.
-            fresh_url = state.url_refresher()
-            if fresh_url:
-                state.master_url = fresh_url
         text = _fetch(state.master_url, tag='handler:auto-master', headers=state.headers)
         if not text and _can_refresh(state):
             # Cold-slot miss: JWT was empty when the channel was registered
@@ -3300,20 +3228,17 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             # code, so this just retries the same URL rather than branching
             # on the failure reason.
             time.sleep(_AUTO_MASTER_RETRY_DELAY)
-            if state.refresh_on_failure and _can_refresh(state):
-                # a provider that wants a new address after a failure gets to hand out another one each time (Pluto:
-                # another forwarded address, if the stitcher refuses the session of the one in use)
-                fresh_url = state.url_refresher()
-                if fresh_url:
-                    state.master_url = fresh_url
             text = _fetch(state.master_url, tag=f'handler:auto-master-retry{attempt + 1}', headers=state.headers)
         if not text:
             self._send(502, b'Bad gateway', 'text/plain')
             return
         # Detect a separate audio rendition (EXT-X-MEDIA TYPE=AUDIO).  Only
         # demuxed streams need the muxing proxy; all others are redirected.
-        # (A rendition without URI is the audio of the video segments, see needs_audio_mux.)
-        if not HLSPlaylist.needs_audio_mux(text):
+        needs_mux = any(
+            line.startswith('#EXT-X-MEDIA:') and 'TYPE=AUDIO' in line
+            for line in text.splitlines()
+        )
+        if not needs_mux:
             # Plain muxed stream: LiveProxyMuxed keeps its ad breaks (discontinuities) from reaching the
             # decoder, or redirects Enigma2 straight to the real URL if the stream can't be processed.
             from . import LiveProxyMuxed  # deferred: LiveProxyMuxed imports from this module
@@ -3392,15 +3317,12 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             i += 1
 
         audio_url = HLSPlaylist.select_primary_audio(audio_candidates)
-        logger.debug('%s: audio renditions (uri, default, accessibility): %s', channel_id,
-                     [(uri.split('?')[0].rsplit('/', 2)[-2], default, accessibility)
-                      for uri, default, accessibility in audio_candidates])
         with state._lock:
             state.audio_url = audio_url
             state.variant_urls = variant_urls
 
         if audio_url:
-            logger.debug('%s: audio rendition → %s', channel_id, audio_url)
+            logger.debug('%s: audio rendition → %s', channel_id, _redact(audio_url))
             # Start the audio pre-fetch thread the first time audio_url is known.
             state.start_audio_prefetch_if_needed(channel_id)
         logger.debug('%s: %s variant(s) registered', channel_id, len(variant_urls))
@@ -3607,10 +3529,6 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             t_wait = time.monotonic()
             while state.ready_seg_count() < min_segs and time.monotonic() < cold_deadline:
                 time.sleep(0.05)
-            if not is_vod and state.ready_seg_count() == 1 and 0 < state.first_ready_size() < _SLATE_WINDOW_BYTES:
-                slate_deadline = time.monotonic() + _SLATE_WAIT
-                while state.ready_seg_count() < 2 and time.monotonic() < slate_deadline:
-                    time.sleep(0.05)
             logger.debug('%s: first playlist: variant playlist %.2fs, audio playlist %.2fs, audio segments %.2fs%s, '
                          'waited %.2fs for %s ready segment(s), %s ready',
                          channel_id, t_variant - t_begin, t_audio_playlist - t_variant, t_audio - t_audio_playlist,
