@@ -1,0 +1,15 @@
+msgid ""
+msgstr ""
+"Language: de\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "Log level"
+msgstr "Log-Stufe"
+
+msgid "Select debug log level."
+msgstr "Auswahl einer Log-Stufe"
+
+msgid "Setup"
+msgstr "Einstellungen"
