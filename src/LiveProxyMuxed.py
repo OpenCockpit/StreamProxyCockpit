@@ -399,8 +399,11 @@ def _stream_spans(ts: bytes) -> 'tuple | None':
     layout = _stream_layout(ts)
     if layout is None:
         return None
-    apid = next((pid for st, pid in layout[2] if st in _AUDIO_STREAM_TYPES), None)
-    vpid = next((pid for st, pid in layout[2] if st in _VIDEO_STREAM_TYPES), None)
+    # False positive - layout is not None here, pylint does not narrow it after the check above.
+    # pylint: disable-next=unsubscriptable-object
+    streams = layout[2]
+    apid = next((pid for st, pid in streams if st in _AUDIO_STREAM_TYPES), None)
+    vpid = next((pid for st, pid in streams if st in _VIDEO_STREAM_TYPES), None)
     if apid is None or vpid is None:
         return None
     apts = _pes_start_pts(ts, apid)

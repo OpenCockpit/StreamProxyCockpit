@@ -275,6 +275,11 @@ _FFMPEG_TIMEOUT = 30           # seconds; _ffmpeg_mux is a stream-copy (no trans
 #                              # temp-file I/O overhead, not segment playback duration
 #                              # — a flat ceiling, not a seg_duration-scaled one. ~30x
 #                              # the typically-observed sub-second mux time.
+_PTS_JUMP_TICKS = 20 * 90000   # a gap this big between two consecutive video frames of one rendition buffer is a splice of
+#                              # another stream that no #EXT-X-DISCONTINUITY announced (seen: +13.9 h at an ad break); a window
+#                              # ends in front of it and the next one starts after it, see _RenditionBuffer.cut
+_SILENCE_MAX_SECS = 20         # the silence _ffmpeg_mux makes for a window without audio never runs longer: a video with a
+#                              # timeline jump in it would make ffmpeg generate the whole gap (hours) and run into the timeout
 # All time budgets are derived per-channel from _ChannelState.seg_duration at runtime:
 #   poll interval  = seg_duration / 5        (≈5× per segment)
 #   fetch timeout  = seg_duration × 0.8
@@ -462,7 +467,8 @@ class _RenditionBuffer:
     """
     __slots__ = ('epoch', 'is_disc_epoch', 'first_window_emitted',
                  'data', 'pts_list', 'off_list',
-                 'last_pat_pmt', 'created_at', 'last_append_at', 'closed_at')
+                 'last_pat_pmt', 'created_at', 'last_append_at', 'closed_at',
+                 'jump_next_pts', 'jump_skipped', 'disc_pending')
 
     def __init__(self, epoch: int, is_disc_epoch: bool):
         self.epoch = epoch
@@ -481,6 +487,12 @@ class _RenditionBuffer:
         self.created_at = time.monotonic()
         self.last_append_at = self.created_at
         self.closed_at: 'float | None' = None
+        # What the last cut() found: an unflagged jump of the timeline (see _PTS_JUMP_TICKS) that ended the window, with the PTS
+        # that the next window starts at; a jump behind a lone leading frame, which was dropped with it; and whether the next
+        # window is the first one after a jump (it is flagged as a discontinuity).
+        self.jump_next_pts: 'int | None' = None
+        self.jump_skipped = False
+        self.disc_pending = False
 
     def append(self, ts_bytes: bytes, pts_offsets: list, pat_pmt: 'bytes | None'):
         """Extend the buffer with *ts_bytes*, whose PTS index and PAT/PMT
@@ -550,6 +562,25 @@ class _RenditionBuffer:
             end_i = bisect.bisect_left(self.pts_list, end_pts) - 1
             if end_i < start_i:
                 return None
+        # A forward jump of the timeline that no #EXT-X-DISCONTINUITY announced (another stream spliced in): the window ends in
+        # front of it, the caller starts the next one after it (jump_next_pts) and flags that one as a discontinuity. Muxed as one
+        # window, the jump made ffmpeg generate hours of silence to fill it. A lone frame in front of the jump is dropped.
+        self.jump_next_pts = None
+        self.jump_skipped = False
+        i = start_i
+        while end_pts is None and i < end_i:   # only for the video window (a cut with an end is an audio slice of a known range)
+            if self.pts_list[i + 1] - self.pts_list[i] > _PTS_JUMP_TICKS:
+                if i == start_i:
+                    start_i = i + 1
+                    self.jump_skipped = True
+                    i = start_i
+                    continue
+                end_i = i
+                self.jump_next_pts = self.pts_list[i + 1]
+                break
+            i += 1
+        if end_i < start_i:
+            return None
         start_off = self.off_list[start_i]
         end_off = self.off_list[end_i + 1] if end_i + 1 < len(self.off_list) else len(self.data)
         chunk = bytes(self.data[start_off:end_off])
@@ -754,7 +785,8 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
                '-probesize', '200000', '-analyzeduration', '1000000',
                '-i', vfile,
                '-itsoffset', f'{v_pts / 90000.0:.6f}',
-               '-f', 'lavfi', '-i', f'anullsrc=channel_layout={_channel_layout}:sample_rate={_sample_rate}',
+               '-f', 'lavfi', '-t', str(_SILENCE_MAX_SECS),
+               '-i', f'anullsrc=channel_layout={_channel_layout}:sample_rate={_sample_rate}',
                '-c:v', 'copy', '-c:a', 'aac', '-b:a', '64k',
                '-map', '0:v:0', '-map', '1:a:0',
                '-shortest',
@@ -1768,6 +1800,15 @@ def _cut_and_mux_next_window(channel_id: str, state: '_ChannelState') -> bool:
         return False
 
     is_disc = vbuf.is_disc_epoch and not vbuf.first_window_emitted
+    # the first window after a jump of the timeline that no tag announced is a real transition too
+    if vbuf.disc_pending or vbuf.jump_skipped:
+        is_disc = True
+        logger.debug('%s: Event: window starts after an unflagged jump of the video timeline | Action: flag it as a discontinuity',
+                     channel_id)
+    vbuf.disc_pending = vbuf.jump_next_pts is not None
+    if vbuf.disc_pending:
+        logger.debug('%s: Event: unflagged jump of the video timeline after pts=%s, next window starts at %s | Action: window ends here',
+                     channel_id, actual_end, vbuf.jump_next_pts)
     vbuf.first_window_emitted = True
 
     aslice, a_pts, covered = _slice_audio_for_window(
@@ -1866,7 +1907,8 @@ def _cut_and_mux_next_window(channel_id: str, state: '_ChannelState') -> bool:
     # Not actual_end: cut() deliberately holds back vbuf's own current last
     # indexed entry (see its own comment) so the next cut's start_i lands on
     # that still-unreleased entry instead of re-matching the one just cut.
-    state._video_cursor_pts = vbuf.pts_list[-1]
+    # (a window that ended in front of a jump of the timeline: the next one starts after it)
+    state._video_cursor_pts = vbuf.jump_next_pts if vbuf.jump_next_pts is not None else vbuf.pts_list[-1]
     vbuf.trim_before(actual_start, retain_bytes=_VIDEO_BUFFER_RETAIN_MARGIN_BYTES)
     return True
 
