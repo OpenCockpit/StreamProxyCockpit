@@ -324,6 +324,26 @@ _AUDIO_STREAM_TYPES = (0x03, 0x04, 0x0F, 0x11, 0x81)   # MPEG audio, AAC (ADTS, 
 _VIDEO_STREAM_TYPES = (0x01, 0x02, 0x1B, 0x24)          # MPEG video, H.264, H.265
 
 
+def _remux_pid_args(layout: 'tuple | None') -> list:
+    """ffmpeg options that give the remux the PIDs of *layout* (see _stream_layout).
+
+    The player has been fed the first segments unchanged, so it knows their PIDs. ffmpeg numbers its own (PMT 4096,
+    video 256, audio 257); remuxing from a later segment on with those moved the picture to another PID than the
+    one the player's video decoder was reading, and the picture froze while the sound, on the same PID in both
+    layouts, played on."""
+    if layout is None:
+        return []
+    pmt_pid, _, streams = layout
+    video = next((pid for stream_type, pid in streams if stream_type in _VIDEO_STREAM_TYPES), None)
+    if video is None:
+        return []
+    args = ['-mpegts_pmt_start_pid', str(pmt_pid), '-streamid', f'0:{video}']
+    audio = next((pid for stream_type, pid in streams if stream_type in _AUDIO_STREAM_TYPES), None)
+    if audio is not None:
+        args += ['-streamid', f'1:{audio}']
+    return args
+
+
 def _frame_ticks(pts_list: list, default: int) -> int:
     """The most common distance between consecutive distinct timestamps (one frame), *default* if there are too few."""
     distinct = sorted(set(pts_list))
@@ -805,7 +825,7 @@ class _MuxedChannel:
             self._normalize_all = True
         cmd = [_FFMPEG, '-loglevel', 'error', '-probesize', '1000000', '-analyzeduration', '2000000', '-i', 'pipe:0',
                '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', '-copyts', '-f', 'mpegts', '-pes_payload_size', '0',
-               '-pat_period', '2', 'pipe:1']
+               '-pat_period', '2'] + _remux_pid_args(self._raw_layout) + ['pipe:1']
         try:
             r = subprocess.run(cmd, input=data, capture_output=True, timeout=_FFMPEG_TIMEOUT, check=False)
             if r.returncode == 0 and r.stdout:
