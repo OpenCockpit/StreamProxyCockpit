@@ -66,6 +66,11 @@ def _segments(channel, state):
         if seq is not None:
             item = channel.wait_for(seq, _READ_WAIT)
         if item is None:
+            if channel.closed and channel.stopped:
+                # closed on purpose (a provider took the stream slot of the channel for another one): restarting it
+                # would put it on the identity of that other channel again and end both sessions at the provider
+                logger.debug('%s: muxed channel closed, the recording ends', channel.channel_id)
+                return
             if channel.closed:
                 channel = _reopen(channel, state, failures)
                 failures += 1

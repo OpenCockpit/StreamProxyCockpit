@@ -552,9 +552,17 @@ class _MuxedChannel:
         self._hold_until = 0.0                        # until when the newest segments are held back from it
         self._start_target = 1                        # segments in the ring before the channel counts as ready
         self._created = time.monotonic()
+        self._cdn_next = None          # the CDN sequence number after the last segment handled
+        self._resume_cdn = None        # where the poller this one replaces stopped, see _loop
         if inherit is not None:
             # replaces a poller that stopped under a recorder: continue its timeline and continuity counters, so the
             # recording stays one continuous file; the first segment is a discontinuity of the source
+            # The served numbering goes on as well: a player that is watching the channel has fetched the segments
+            # up to there already and asks for the next number. Numbered from 0 again, the new segments up to its
+            # last number would never be fetched (it takes them for old ones), the timeline of the segments it does
+            # fetch would jump ahead by their length, and the decoders lose their sync (audio gone until the next zap).
+            self._next_seq = inherit._next_seq
+            self._resume_cdn = inherit._cdn_next
             self._cc = dict(inherit._cc)
             self._delta = inherit._delta
             self._expected = inherit._expected
@@ -570,6 +578,13 @@ class _MuxedChannel:
 
     def stop(self):
         self._stop.set()
+
+    @property
+    def stopped(self) -> bool:
+        """True if the channel was closed on purpose (stop(), see close_channel), not because its poller ran out of
+        stream or failed. A recorder doesn't restart such a channel: the address it would use may be another
+        channel's by now (a provider hands out its device identities to other channels once it closes one)."""
+        return self._stop.is_set()
 
     def touch(self):
         self.last_access = time.monotonic()
@@ -728,7 +743,17 @@ class _MuxedChannel:
                 return
             segments = media.segments
             if next_seq is None and segments:
-                next_seq = segments[0].seq if media.endlist else segments[max(0, len(segments) - _start_count(segments))].seq
+                if self._resume_cdn is not None and self._resume_cdn <= segments[-1].seq + 1:
+                    # the same session of the stream goes on: after the segment the poller before us handled last, not
+                    # a few segments back from the live edge or at the start of an ended playlist - those are played
+                    # already, and with the timeline continued they would be played again as new content
+                    next_seq = max(self._resume_cdn, segments[0].seq)
+                    logger.debug('%s: poller restarted, continuing at seq %s (playlist %s..%s)', self.channel_id, next_seq,
+                                 segments[0].seq, segments[-1].seq)
+                else:
+                    # a new session of the stream, numbered from its own base (or the first start)
+                    next_seq = segments[0].seq if media.endlist else segments[max(0, len(segments) - _start_count(segments))].seq
+                self._resume_cdn = None
             fresh = []
             preloaded: dict = {}
             if segments:
@@ -751,6 +776,7 @@ class _MuxedChannel:
                     return
                 self._handle_segment(seg, preloaded.pop(seg.seq, None))
                 next_seq = seg.seq + 1
+                self._cdn_next = next_seq
                 last_progress = time.monotonic()
             if not self.status and self.ready:
                 self._set_status('ok')   # fewer segments than planned (one was lost): don't wait for more

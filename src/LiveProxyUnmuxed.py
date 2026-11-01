@@ -3012,6 +3012,24 @@ def close_channel(channel_id: str) -> bool:
     return True
 
 
+def drop_channel(channel_id: str) -> bool:
+    """close_channel(), and the proxy forgets the channel at once: for a provider that gives the stream slot of a
+    channel to another one.
+
+    A closed channel that stays registered is revived by the next recorder that connects to it (_ensure_pipeline
+    reopens it), and TimeshiftCockpit starts a new recording the moment the response of one ends - which it does when
+    the channel is closed under it. The channel would then run again on the address of the slot it just lost, the one
+    of the channel that has it now, and the provider ends the session of one of them (log of 16:54: the stream that
+    had just got the slot ended after 0.3s). Forgotten, the channel answers a recorder with a 404; playing it again
+    registers it afresh.
+
+    Returns False if the proxy didn't know the channel."""
+    closed = close_channel(channel_id)
+    with _state_lock:
+        known = _channels.pop(channel_id, None) is not None
+    return closed or known
+
+
 _IDLE_TIMEOUT = 60.0   # seconds of no HTTP request before an unreferenced channel's
 #                      # pre-fetch threads (and CDN polling / ffmpeg muxing) are torn
 #                      # down; the backstop for any teardown path that doesn't call
@@ -3238,6 +3256,22 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
 
     # ── /auto/{channel_id}.m3u8 ───────────────────────────────────────────
 
+    def _left(self, channel_id: str, state: '_ChannelState') -> bool:
+        """Answer 503 and return True if the channel was closed (the live slot moved on) since the player asked
+        for it, so that nothing is started for it.
+
+        Zapping fast, the player of a channel that was left a moment ago still has its /auto request in flight: the
+        channel is only created here (LiveProxyMuxed) or its pre-fetch threads are only started (the demuxed
+        path) once the master playlist is in, after close_channel has run and found nothing to stop. Nobody asks
+        for the channel again, and it downloads segments until the idle reaper ends it a minute later: with
+        Samsung's 3 MB segments seven such channels slowed the start of the one being zapped to from 1.3s to
+        5-9s (log of 17:03). A new zap to the channel registers it again, which opens it."""
+        if not state._audio_prefetch_stop.is_set():
+            return False
+        logger.debug('%s: closed before the player was served, not started', channel_id)
+        self._send(503, b'Channel closed', 'text/plain')
+        return True
+
     def _handle_auto(self, channel_id: str):
         """Fetch the real master playlist, detect demuxed audio, and either
         process it through the muxing proxy or redirect servicemp3 directly
@@ -3245,6 +3279,8 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
         state = _get_state(channel_id)
         if not state:
             self._send(404, b'Unknown channel', 'text/plain')
+            return
+        if self._left(channel_id, state):
             return
         resolved_master_url(state)
         text = _fetch(state.master_url, tag='handler:auto-master', headers=state.headers)
@@ -3270,6 +3306,8 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             text = _fetch(state.master_url, tag=f'handler:auto-master-retry{attempt + 1}', headers=state.headers)
         if not text:
             self._send(502, b'Bad gateway', 'text/plain')
+            return
+        if self._left(channel_id, state):   # closed while the master playlist was fetched
             return
         # Detect separate audio renditions (EXT-X-MEDIA TYPE=AUDIO with a URI).  Only demuxed streams need the muxing
         # proxy; all others, including those whose "Original" rendition has no URI (its audio is in the video

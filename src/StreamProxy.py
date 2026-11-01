@@ -40,6 +40,7 @@ _CHANNEL_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _PROXY_STREAM_RE = re.compile(r"/(?:auto|rec)/([A-Za-z0-9._-]+?)\.(?:m3u8|ts)$", re.IGNORECASE)
 
 _live_channel_id = None  # channel id currently resolved for the live/foreground slot
+_navigation = None       # the Navigation of Enigma2, as handed to the service extensions
 
 
 def registerProvider(scheme, resolve):
@@ -139,19 +140,35 @@ def _resolve(sref):
     return eServiceReference(":".join(parts)), channel_id
 
 
+def live_channel_id():
+    """The channel of the live slot, None if there is none. While a zap resolves its target this is still the channel
+    that is being left, which playServiceExtension closes afterwards unless a recorder uses it."""
+    return _live_channel_id
+
+
+def _timerRecords(nav, channel_id):
+    """True if a currently running, non-justplay record timer (an instant recording is one too) targets *channel_id*."""
+    for timer in nav.RecordTimer.timer_list:
+        if timer.isRunning() and not timer.justplay:
+            if channelId(timer.service_ref.ref)[1] == channel_id:
+                return True
+    return False
+
+
+def timer_records(channel_id):
+    """_timerRecords with the Navigation seen in the last service extension call, for a provider that has to tell a
+    recording the user wants (a timer) from a timeshift, which is just a recorder connected to /rec/. False until the
+    first service has been played."""
+    return _navigation is not None and _timerRecords(_navigation, channel_id)
+
+
 def _isRecording(nav, channel_id):
     """True if a currently running, non-justplay record timer targets *channel_id*, or any recorder (e.g. a
     TimeshiftCockpit timeshift, which is not a timer) is connected to its /rec/ endpoint.
 
     Used to veto closing a channel that the live slot is leaving but that a background recording still depends on
     - see playServiceExtension."""
-    if LiveProxyUnmuxed.is_recording_active(channel_id):
-        return True
-    for timer in nav.RecordTimer.timer_list:
-        if timer.isRunning() and not timer.justplay:
-            if channelId(timer.service_ref.ref)[1] == channel_id:
-                return True
-    return False
+    return LiveProxyUnmuxed.is_recording_active(channel_id) or _timerRecords(nav, channel_id)
 
 
 def playServiceExtension(_nav, sref, *_args, **_kwargs):
@@ -161,7 +178,8 @@ def playServiceExtension(_nav, sref, *_args, **_kwargs):
     zapping to a service of no provider never reaches a provider at all, so without closing the previous channel
     here its pre-fetch threads would keep polling the CDN indefinitely. Skipped when a recorder still uses that
     channel (see _isRecording): closing it then would kill its pre-fetch threads mid-recording."""
-    global _live_channel_id
+    global _live_channel_id, _navigation
+    _navigation = _nav
     sref, channel_id = _resolve(sref)
     if (_live_channel_id and _live_channel_id != channel_id
             and not _isRecording(_nav, _live_channel_id)):
@@ -177,6 +195,8 @@ def recordServiceExtension(_nav, sref, *_args, **_kwargs):
     live playback. The result is then repointed from the segment-chunked HLS address (/auto/<id>.m3u8) live
     playback uses to RecordingProxyUnmuxed's continuous, container-harmonized re-mux endpoint (/rec/<id>.ts) - see
     RecordingProxyUnmuxed.py for why a recorded file needs different framing than a live HLS pipeline."""
+    global _navigation
+    _navigation = _nav
     sref, channel_id = _resolve(sref)
     if channel_id is not None:
         rec_url = f"http://{LiveProxyUnmuxed.PROXY_HOST}:{LiveProxyUnmuxed.PROXY_PORT}/rec/{channel_id}.ts"
