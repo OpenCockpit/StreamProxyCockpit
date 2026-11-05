@@ -13,6 +13,14 @@ def openSettings(session, **__kwargs):
     session.open(SetupScreen)
 
 
+def menuHook(menuid, **__kwargs):
+    # Menu / Setup / Recordings, Playback & Timeshift, after Recording (weight 10), Playback (12), Timeshift (15) and
+    # TimeshiftCockpit (16)
+    if menuid == "rec":
+        return [(PLUGIN, openSettings, "streamproxycockpit_setup", 17)]
+    return []
+
+
 def autoStart(reason, **__kwargs):
     if reason == 0:  # startup
         logger.info("+++ Version: %s starts...", VERSION)
@@ -33,5 +41,12 @@ def Plugins(**__kwargs):
             icon="plugin.png",
             where=PluginDescriptor.WHERE_PLUGINMENU,
             fnc=openSettings
+        ),
+        PluginDescriptor(
+            name=PLUGIN,
+            description=_("Settings of the stream proxy"),
+            where=PluginDescriptor.WHERE_MENU,
+            needsRestart=False,
+            fnc=menuHook
         ),
     ]
