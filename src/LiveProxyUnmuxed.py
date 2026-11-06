@@ -173,6 +173,17 @@ _LATE_AUDIO_WAIT_FACTOR = 2.0  # _resolve_late_audio_window's retry budget, x se
 #                              # recoveries and _fetch_one's own worst-case two-attempt retry
 #                              # (up to ~2 x seg_duration x 0.8 with no gap between attempts)
 #                              # without the pointless tail on a genuine gap.
+_EXACT_EXTINF = True           # the live playlist declares what the windows really are, and never changes it (state.window_durations):
+#                              # #EXTINF is the distance to the start of the next window on the served timeline, not the video pts
+#                              # range (end_pts - start_pts), and #EXT-X-DISCONTINUITY-SEQUENCE counts the tags of this playlist, not
+#                              # the CDN's. Measured on ad breaks (CBS, 2026-11-05): the windows of an ad were declared 4.757 s and are
+#                              # 5.0 s long (150 frames at 30/s), the programme's are exact (5.000 s). A first version corrected the
+#                              # value only once the next window existed: the newest window of every playlist still had the short
+#                              # one, and a player keeps what it saw first. At the join after an ad the receiver's clock stepped back
+#                              # 0.84 s (/proc/stb/vmpeg/0/pts: the video 0.84 s late against the audio of the programme, which
+#                              # plays while the last pictures of the ad are still shown). The CDN's discontinuity sequence also
+#                              # numbered the same window differently in two playlists in a row (26 and 27). Recordings of the same
+#                              # bytes, played by Enigma2's own player, do not do that. False restores the old values.
 _DISC_AUDIO_PEEK_WAIT = 1.5    # seconds _cut_and_mux_next_window's synchronous audio check
 #                              # waits for a disc-introducing window specifically, instead of
 #                              # the true zero-wait peek this used to be. Motivated directly by
@@ -635,10 +646,21 @@ class _RenditionBuffer:
         self.closed_at = time.monotonic()
 
 
+# The picture type in the access unit delimiters of the video. ffmpeg's MPEG-TS muxer puts the same delimiter (09 f0:
+# "every kind of slice") in front of every picture it writes. The index of a recording that Enigma2 makes (the .sc file)
+# is built from these delimiters, and Enigma2 takes only a delimiter of type 0 ("I slices only") for an I-frame: with
+# type 7 everywhere it finds no I-frame in the whole recording. Rewind then falls back to jumping back a fixed number of
+# bytes, which at 2x and 4x is the length of the block it reads (no progress at all) and works from 8x on. h264_metadata
+# writes the delimiter from what the slices really are (I, I/P, I/P/B). Only for H.264: for anything else, or a ffmpeg
+# without the filter, the mux fails once and is done without it from then on (_AUD_FILTER['on']).
+_AUD_BSF = 'h264_metadata=aud=remove,h264_metadata=aud=insert'
+_AUD_FILTER = {'on': True}
+
+
 def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
                 state: '_ChannelState | None' = None, is_disc: bool = False,
                 track_cc: bool = False, reset_cc: 'bool | None' = None,
-                v_pts: 'int | None' = None, a_pts: 'int | None' = None) -> bytes:
+                v_pts: 'int | None' = None, a_pts: 'int | None' = None, aud_filter: bool = True) -> bytes:
     """Mux video-only and audio-only TS segments via system ffmpeg.
 
     Both inputs are written to seekable temp files so ffmpeg can probe each
@@ -804,6 +826,12 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
             cmd += ['-mpegts_flags', mpegts_flags]
         cmd += ['-pat_period', '2', 'pipe:1']
 
+    use_aud_filter = aud_filter and _AUD_FILTER['on']
+    if use_aud_filter:
+        # in front of the output format ("-f mpegts"; the silence input has a "-f lavfi" of its own before): see _AUD_BSF
+        i = cmd.index('mpegts') - 1
+        cmd[i:i] = ['-bsf:v', _AUD_BSF]
+
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=_FFMPEG_TIMEOUT, check=False)
         if r.returncode == 0 and r.stdout:
@@ -815,13 +843,25 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
         label = 'av' if audio_data else ('silence' if v_pts is not None else 'video-only')
         logger.debug('_ffmpeg_mux %s rc=%s out=%sb: %s',
                      label, r.returncode, len(r.stdout), r.stderr.decode(errors="replace")[-300:])
+        if use_aud_filter and re.search(r'bitstream filter|h264_metadata|\bbsf\b', r.stderr.decode(errors='replace'), re.IGNORECASE):
+            # The error names the filter (video that is not H.264, a ffmpeg without it): this window without it, and the
+            # filter is not used any more if that works. Only then: every other failure (the unusable audio slice below,
+            # "Stream map '' matches no streams") is the window's own, and the filter stays - a first version took any
+            # mux that worked without the filter for proof against it, and the one window of 67 ms with no audio at 12:21
+            # switched it off for the rest of the session (recordings made after that had no I-frames for the rewind again).
+            plain = _ffmpeg_mux(video_data, audio_data, state, is_disc=is_disc, track_cc=track_cc, reset_cc=reset_cc,
+                                v_pts=v_pts, a_pts=a_pts, aud_filter=False)
+            if plain is not video_data:
+                _AUD_FILTER['on'] = False
+                logger.debug('_ffmpeg_mux: works without the delimiter filter, not used any more (see _AUD_BSF)')
+            return plain
         if audio_data and v_pts is not None:
             # The audio slice had no usable audio (a window of a few frames at a stream splice): returning the video
             # as it came would give a window without audio whose timestamps lack the offset of every muxed one (about
             # 1.4 s: the timeline went back there and the decoder dropped audio). Mux it with silence instead.
             logger.debug('_ffmpeg_mux: retry with silence instead of the unusable audio slice')
             return _ffmpeg_mux(video_data, None, state, is_disc=is_disc, track_cc=track_cc, reset_cc=reset_cc,
-                               v_pts=v_pts)
+                               v_pts=v_pts, aud_filter=aud_filter)
         return video_data
     except Exception as exc:
         logger.debug('_ffmpeg_mux exception: %s', exc)
@@ -852,7 +892,7 @@ class _ChannelState:
                  '_cc_resync_pending', '_last_playlist_out', '_last_segment_out',
                  '_pending_audio_floors', '_vod_complete', '_video_preload', '_video_first_playlist',
                  '_live_delta', '_live_expected', '_live_prev_end', '_live_gap',
-                 '_window_delta', '_shift_cache')
+                 '_window_delta', '_shift_cache', '_extinf', '_disc_before', '_disc_count')
 
     @property
     def headers(self) -> 'dict | None':
@@ -972,6 +1012,9 @@ class _ChannelState:
         self._live_prev_end = None       # end PTS of the previous window as muxed (unshifted)
         self._live_gap = _LIVE_GAP_TICKS  # measured distance between one window's end and the next one's start
         self._window_delta: dict = {}    # chunk_seq -> the shift of that window
+        self._extinf: dict = {}          # chunk_seq -> the #EXTINF the live playlist declares for it, decided once (see window_durations)
+        self._disc_before: dict = {}     # chunk_seq -> how many windows with a discontinuity were published before it
+        self._disc_count = 0             # the windows with a discontinuity published so far
         self._shift_cache: dict = {}     # chunk_seq -> (muxed bytes, shifted bytes) of the latest served
         self._video_preload: 'dict[str, Future]' = {}   # VOD start only: video segment url -> its download, started
         #                                 # by _handle_playlist while the audio is still being fetched
@@ -1111,6 +1154,12 @@ class _ChannelState:
         self._window_delta[seq] = self._live_delta
         while len(self._window_delta) > _MAX_SEG_CACHE:
             self._window_delta.pop(next(iter(self._window_delta)))
+        # for #EXT-X-DISCONTINUITY-SEQUENCE of the playlist (see _EXACT_EXTINF): the number of the transitions in front of a window
+        self._disc_before[seq] = self._disc_count
+        if is_disc:
+            self._disc_count += 1
+        while len(self._disc_before) > _MAX_SEG_CACHE:
+            self._disc_before.pop(next(iter(self._disc_before)))
 
     def reset_live_delta(self):
         """Forget the timeline (the cached windows are dropped, see register_channel). Lock held by the caller."""
@@ -1119,7 +1168,49 @@ class _ChannelState:
         self._live_prev_end = None
         self._live_gap = _LIVE_GAP_TICKS
         self._window_delta.clear()
+        self._extinf.clear()
+        self._disc_before.clear()
         self._shift_cache.clear()
+
+    def window_durations(self, seqs: list, metas: dict, deltas: dict) -> dict:
+        """The #EXTINF (seconds) of each live window in *seqs* (in order), decided the first time the window is listed and
+        never changed after: a player keeps the duration it saw first, and the stream time of everything after it is the sum of
+        them, so a value that changes from one playlist to the next, or that is shorter than the window, makes the timeline of
+        the player run behind the stream (see _EXACT_EXTINF).
+
+        The video pts range of a window (end_pts - start_pts) is shorter than the window: the pictures in front of its first
+        one (displayed before it) and the last frame are not in it. What is right is the distance to the start of the next
+        window on the served timeline, which a window that was just published (the newest in the list) does not have yet:
+        it gets the duration of the window before it, which the windows of a stream differ from by hundredths of a second.
+        The first window after a transition starts at its first picture, its range plus one gap is its duration."""
+        with self._lock:
+            durations = {}
+            previous = None
+            for n, seq in enumerate(seqs):
+                known = self._extinf.get(seq)
+                if known is None:
+                    meta = metas.get(seq)
+                    if meta is None:
+                        continue
+                    span = max(0.0, (meta.end_pts - meta.start_pts) / 90000.0)
+                    following = metas.get(seqs[n + 1]) if n + 1 < len(seqs) else None
+                    if meta.is_disc:
+                        known = span + _LIVE_GAP_TICKS / 90000.0   # (not the measured gap: inside an ad that is the 0.24 s the cut leaves out)
+                    elif following is not None and not following.is_disc:
+                        step = ((following.start_pts + deltas.get(seqs[n + 1], 0)) - (meta.start_pts + deltas.get(seq, 0))) & _TS_MASK
+                        if step >= 1 << 32:
+                            step -= 1 << 33
+                        known = step / 90000.0 if span <= step / 90000.0 <= span + 1.0 else span
+                    elif previous is not None and span <= previous <= span + 1.0:
+                        known = previous   # the newest window, or the last one in front of a transition
+                    else:
+                        known = span
+                    self._extinf[seq] = known
+                    while len(self._extinf) > _MAX_SEG_CACHE:
+                        self._extinf.pop(next(iter(self._extinf)))
+                durations[seq] = known
+                previous = known
+            return durations
 
     def timeline_adjusted(self, seq: int, data: bytes) -> bytes:
         """*data* (window *seq* as muxed) with its timestamps shifted as assign_live_delta decided."""
@@ -3629,6 +3720,8 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                     or stripped == '#EXT-X-DISCONTINUITY'
                     or stripped.startswith('#EXT-X-MEDIA-SEQUENCE:')
                     or stripped.startswith('#EXTINF:')
+                    # the CDN's count of its own transitions does not belong to the tags of this playlist (see _EXACT_EXTINF)
+                    or (_EXACT_EXTINF and not channel_id.startswith('vod') and stripped.startswith('#EXT-X-DISCONTINUITY-SEQUENCE:'))
                     # A VOD source's own manifest carries #EXT-X-PLAYLIST-TYPE:VOD
                     # and/or #EXT-X-ENDLIST - copying either straight through
                     # tells GStreamer's hlsdemux "this is the complete asset",
@@ -3653,10 +3746,23 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
         with state._lock:
             advertise_seqs = list(state._ready_segs.keys())[-window_size:]
             window_meta = dict(state._window_meta)
+            window_delta = {seq: state._window_delta.get(seq, 0) for seq in advertise_seqs}
+            disc_before = state._disc_before.get(advertise_seqs[0]) if advertise_seqs else None
+            first_meta = window_meta.get(advertise_seqs[0]) if advertise_seqs else None
+            if disc_before is not None and first_meta is not None and first_meta.is_disc:
+                disc_before += 1   # its own tag stands in front of it: the number of a window counts that one too
 
         media_seq = advertise_seqs[0] if advertise_seqs else state._next_chunk_seq
         insert_at = 1 if out and out[0].strip() == '#EXTM3U' else 0
         out.insert(insert_at, f'#EXT-X-MEDIA-SEQUENCE:{media_seq}')
+        live_durations = None
+        if _EXACT_EXTINF and not channel_id.startswith('vod'):
+            # The number of the transitions in front of the first window of this playlist, counted from the tags that this
+            # playlist has (a segment has the number of the one before it, plus one for a tag in front of it). The CDN's
+            # number runs ahead of ours by one at times, which numbered the same window differently in two playlists in a row.
+            if disc_before is not None:
+                out.insert(insert_at + 1, f'#EXT-X-DISCONTINUITY-SEQUENCE:{disc_before}')
+            live_durations = state.window_durations(advertise_seqs, window_meta, window_delta)
         if channel_id.startswith('vod'):
             # Without #EXT-X-ENDLIST/#EXT-X-PLAYLIST-TYPE:VOD (deliberately
             # stripped above so hlsdemux keeps re-polling instead of treating
@@ -3684,6 +3790,8 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             if meta is None:
                 continue
             duration = max(0.0, (meta.end_pts - meta.start_pts) / 90000.0)
+            if live_durations is not None and cseq in live_durations:
+                duration = live_durations[cseq]   # decided once per window, see _ChannelState.window_durations
             if meta.is_disc:
                 out.append('#EXT-X-DISCONTINUITY')
             out.append(f'#EXTINF:{duration:.3f},')
