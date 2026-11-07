@@ -100,6 +100,17 @@ _MAX_AUDIO_EPOCH_LAG = 2       # how far behind (or ahead) video_epoch and audio
 #                              # stabilizes at exactly this value (rather than growing past
 #                              # it) must still trigger the resync, or it can sit there
 #                              # forever without ever crossing a strictly-greater-than check.
+_STALL_DISC_SECS = 7.0         # (0 = off) a live window that is published more than this after the one before (windows come every 5 s; the
+#                              # audio rendition is 9-10 s late in front of every ad break, and the window waits for its audio) is flagged as
+#                              # a discontinuity, so that the decoder of the dm9xx restarts its clock with it. While the player is starved
+#                              # the decoder's clock runs on, and the window that ends the stall carries a PCR about as far behind it as the
+#                              # stall was long; the picture was distorted for a couple of seconds after it (the same decoder behaviour as
+#                              # after a jump of the timeline, see assign_live_delta). Since the flag the switches with such a stall were clean
+_DISC_STALE_START_TOLERANCE = 45000  # 0.5 s (90 kHz ticks): the audio buffer of the epoch before a discontinuity window's own is that
+#                              # window's audio if it STARTS at the window (within this): the audio rendition did not flag the transition
+#                              # that video did (the ad pods), so the audio epoch runs one behind the video epoch and the new content is
+#                              # in the buffer that is one epoch back. An old buffer that starts elsewhere is the old content (see
+#                              # _slice_audio_for_window)
 _DISC_LOOKAHEAD_SEGMENTS = 30  # VOD only: how far ahead, within the current poll's
 #                              # already-fetched playlist, _video_prefetch_loop looks for an
 #                              # upcoming #EXT-X-DISCONTINUITY before letting
@@ -505,6 +516,23 @@ class _RenditionBuffer:
         self.jump_skipped = False
         self.disc_pending = False
 
+    def unwrap(self, pts: int) -> int:
+        """*pts* (as read from the stream) on the same side of the 33-bit wrap as the last indexed PTS."""
+        if not self.pts_list:
+            return pts
+        return pts + (_TS_MASK + 1) * round((self.pts_list[-1] - pts) / (_TS_MASK + 1))
+
+    def _unwrapped(self, pts_offsets: list) -> list:
+        """The (offset, PTS) pairs of a segment with every PTS on the side of the wrap that the one before it is on."""
+        wrap = _TS_MASK + 1
+        ref = self.pts_list[-1]
+        out = []
+        for off, pts in pts_offsets:
+            pts += wrap * round((ref - pts) / wrap)
+            out.append((off, pts))
+            ref = pts
+        return out
+
     def append(self, ts_bytes: bytes, pts_offsets: list, pat_pmt: 'bytes | None'):
         """Extend the buffer with *ts_bytes*, whose PTS index and PAT/PMT
         were already scanned outside any lock by _scan_ts_index (offsets in
@@ -526,6 +554,11 @@ class _RenditionBuffer:
         keep every byte in self.data reachable exclusively through
         pts_list/off_list, which cut()'s slicing assumes.
         """
+        # The 33-bit PTS counter of the CDN wraps every 26.5 hours (the movie of a Pluto channel runs into it: its PTS goes from
+        # 8589.8 million to 0). The index must go on growing, or the cut of the window that holds the wrap ends before it starts
+        # and the proxy never cuts another window: every PTS is put on the side of the wrap that its predecessor is on.
+        if self.pts_list:
+            pts_offsets = self._unwrapped(pts_offsets)
         if self.pts_list and pts_offsets and pts_offsets[0][1] < self.pts_list[-1]:
             return
         base = len(self.data)
@@ -756,7 +789,8 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
         if a_pts is None:
             a_pts = _first_pts(audio_data)
         if v_pts is not None and a_pts is not None:
-            itsoffset = (v_pts - a_pts) / 90000.0
+            # modulo the 33 bits of a timestamp: the two numbers may be on different sides of a wrap of the counter
+            itsoffset = ((v_pts - a_pts + (1 << 32)) % (1 << 33) - (1 << 32)) / 90000.0
             if abs(itsoffset) > 0.020:
                 logger.debug('_ffmpeg_mux: pts v=%s a=%s itsoffset=%.3fs',
                              v_pts, a_pts, itsoffset)
@@ -771,9 +805,9 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
 
     if audio_data:
         cmd = [_FFMPEG, '-y', '-loglevel', 'error',
-               '-probesize', '200000', '-analyzeduration', '1000000',
+               '-correct_ts_overflow', '0', '-probesize', '200000', '-analyzeduration', '1000000',
                '-i', vfile,
-               '-probesize', '200000', '-analyzeduration', '1000000',
+               '-correct_ts_overflow', '0', '-probesize', '200000', '-analyzeduration', '1000000',
                '-itsoffset', f'{itsoffset:.6f}',
                '-i', afile,
                '-c', 'copy',
@@ -804,7 +838,7 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
         # permanently drops audio in Enigma2 in the first place.
         _channel_layout = {1: 'mono', 2: 'stereo'}.get(_channels, 'stereo')
         cmd = [_FFMPEG, '-y', '-loglevel', 'error',
-               '-probesize', '200000', '-analyzeduration', '1000000',
+               '-correct_ts_overflow', '0', '-probesize', '200000', '-analyzeduration', '1000000',
                '-i', vfile,
                '-itsoffset', f'{v_pts / 90000.0:.6f}',
                '-f', 'lavfi', '-t', str(_SILENCE_MAX_SECS),
@@ -819,7 +853,7 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
     else:
         # PTS unreadable; plain single-stream re-mux as last resort.
         cmd = [_FFMPEG, '-y', '-loglevel', 'error',
-               '-probesize', '200000', '-analyzeduration', '1000000',
+               '-correct_ts_overflow', '0', '-probesize', '200000', '-analyzeduration', '1000000',
                '-i', vfile,
                '-c', 'copy', '-f', 'mpegts', '-copyts']
         if mpegts_flags:
@@ -847,7 +881,7 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
             # The error names the filter (video that is not H.264, a ffmpeg without it): this window without it, and the
             # filter is not used any more if that works. Only then: every other failure (the unusable audio slice below,
             # "Stream map '' matches no streams") is the window's own, and the filter stays - a first version took any
-            # mux that worked without the filter for proof against it, and the one window of 67 ms with no audio at 12:21
+            # mux that worked without the filter for proof against it, and one window of 67 ms with no audio
             # switched it off for the rest of the session (recordings made after that had no I-frames for the rewind again).
             plain = _ffmpeg_mux(video_data, audio_data, state, is_disc=is_disc, track_cc=track_cc, reset_cc=reset_cc,
                                 v_pts=v_pts, a_pts=a_pts, aud_filter=False)
@@ -892,7 +926,7 @@ class _ChannelState:
                  '_cc_resync_pending', '_last_playlist_out', '_last_segment_out',
                  '_pending_audio_floors', '_vod_complete', '_video_preload', '_video_first_playlist',
                  '_live_delta', '_live_expected', '_live_prev_end', '_live_gap',
-                 '_window_delta', '_shift_cache', '_extinf', '_disc_before', '_disc_count')
+                 '_window_delta', '_shift_cache', '_extinf', '_disc_before', '_disc_count', '_last_cut_at')
 
     @property
     def headers(self) -> 'dict | None':
@@ -1015,6 +1049,7 @@ class _ChannelState:
         self._extinf: dict = {}          # chunk_seq -> the #EXTINF the live playlist declares for it, decided once (see window_durations)
         self._disc_before: dict = {}     # chunk_seq -> how many windows with a discontinuity were published before it
         self._disc_count = 0             # the windows with a discontinuity published so far
+        self._last_cut_at: 'float | None' = None   # time.monotonic() of the last live window that was cut, see _STALL_DISC_SECS
         self._shift_cache: dict = {}     # chunk_seq -> (muxed bytes, shifted bytes) of the latest served
         self._video_preload: 'dict[str, Future]' = {}   # VOD start only: video segment url -> its download, started
         #                                 # by _handle_playlist while the audio is still being fetched
@@ -1709,8 +1744,15 @@ def _append_audio(state: '_ChannelState', channel_id: str, seq: int, disc: bool,
         }
         if not state._audio_bufs:
             state._audio_bufs.insert(0, _RenditionBuffer(state._audio_epoch, is_disc_epoch=False))
+        before = len(state._audio_bufs[0].pts_list)
         state._audio_bufs[0].append(data, pts_offsets, pat_pmt)
+        accepted = len(state._audio_bufs[0].pts_list) > before   # a segment that goes back in time is refused by the buffer
+        epoch_now = state._audio_bufs[0].epoch
         _prune_audio_bufs(state)
+    # where each audio segment starts, to compare with the video segments (see the matching line of _video_prefetch_loop)
+    logger.debug('%s/%s: audio segment pts=[%s,%s] frames=%s disc=%s epoch=%s %s', channel_id, seq,
+                 min(p for _, p in pts_offsets), max(p for _, p in pts_offsets), len(pts_offsets), disc, epoch_now,
+                 'appended' if accepted else 'REFUSED (goes back in time)')
 
 
 def _slice_audio_for_window(state: '_ChannelState', epoch: int, start_pts: int, end_pts: int,
@@ -1725,7 +1767,8 @@ def _slice_audio_for_window(state: '_ChannelState', epoch: int, start_pts: int, 
     pop_audio_for_pts gated via allow_stale_epoch) whose continuous PTS
     index already covers the full requested range, waiting up to
     *wait_secs* for a buffer to catch up. *is_disc_window* only affects the
-    stale-epoch gating here - callers pass their own explicit *wait_secs*
+    stale-epoch gating here (a disc window takes a buffer one epoch back only if
+    it begins at the window, see _DISC_STALE_START_TOLERANCE) - callers pass their own explicit *wait_secs*
     for the disc case (see _cut_and_mux_next_window's short bounded
     _DISC_AUDIO_PEEK_WAIT and _resolve_late_audio_window's much longer
     _LATE_AUDIO_WAIT_FACTOR budget); the state.seg_duration*1.6 default
@@ -1751,6 +1794,13 @@ def _slice_audio_for_window(state: '_ChannelState', epoch: int, start_pts: int, 
             candidates = [b for b in state._audio_bufs if b.epoch == epoch]
             if not is_disc_window:
                 candidates += [b for b in state._audio_bufs if b.epoch == epoch - 1]
+            else:
+                # A discontinuity window does not take the audio of the epoch before just like that (reset PTS can coincide with
+                # old content), but a buffer of it that begins where the window begins is not old content: it is the audio of
+                # this window, that the audio rendition filed under the epoch before because it never flagged the transition.
+                # Without it the first window of every ad pod and of the movie played without audio (audio epoch one behind).
+                candidates += [b for b in state._audio_bufs if b.epoch == epoch - 1 and b.pts_list
+                               and abs(b.pts_list[0] - start_pts) <= _DISC_STALE_START_TOLERANCE]
             for b in candidates:
                 cut = b.cut(start_pts, end_pts)
                 if cut is not None:
@@ -1906,6 +1956,17 @@ def _cut_and_mux_next_window(channel_id: str, state: '_ChannelState') -> bool:
         state, vbuf.epoch, actual_start, actual_end, is_disc_window=is_disc,
         wait_secs=(_DISC_AUDIO_PEEK_WAIT if is_disc else None),
         channel_id=channel_id)
+
+    # A window that comes long after the one before (the player ran dry), see _STALL_DISC_SECS. Measured here, after the wait for
+    # the audio: the video of such a window is usually there long before (the video loop has fetched well ahead), it is the audio
+    # rendition that comes late, and the window is published only when its audio has arrived.
+    now = time.monotonic()
+    last_cut_at = state._last_cut_at
+    state._last_cut_at = now
+    if _STALL_DISC_SECS > 0 and not is_disc and last_cut_at is not None and now - last_cut_at > _STALL_DISC_SECS:
+        is_disc = True
+        logger.debug('%s: Event: window published %.1f s after the one before (stall) | Action: flag it as a discontinuity',
+                     channel_id, now - last_cut_at)
 
     # reset_cc honors a pending late-audio-upgrade resync (see
     # _resolve_late_audio_window) - kept separate from is_disc itself so a
@@ -2816,7 +2877,7 @@ def _video_prefetch_loop(channel_id: str, state: '_ChannelState',
             v_pts = pts_offsets[0][1]
 
             vbuf = state._video_buf
-            if vbuf.pts_list and v_pts == vbuf.pts_list[-1]:
+            if vbuf.pts_list and vbuf.unwrap(v_pts) == vbuf.pts_list[-1]:
                 # CDN published a duplicate video segment (same PTS as the
                 # previous one) - common at content-transition boundaries
                 # where the encoder repeats the final frame. Simply not
@@ -2829,7 +2890,11 @@ def _video_prefetch_loop(channel_id: str, state: '_ChannelState',
                 fetched_seqs.add(seq)
                 continue
 
+            before = len(vbuf.pts_list)
             vbuf.append(vdata, pts_offsets, pat_pmt)
+            logger.debug('%s/%s: video segment pts=[%s,%s] frames=%s is_disc=%s epoch=%s %s', channel_id, seq,
+                         min(p for _, p in pts_offsets), max(p for _, p in pts_offsets), len(pts_offsets), is_disc, vbuf.epoch,
+                         'appended' if len(vbuf.pts_list) > before else 'REFUSED (goes back in time)')
             if state._video_cursor_pts is None:
                 state._video_cursor_pts = v_pts
 
