@@ -100,12 +100,11 @@ _MAX_AUDIO_EPOCH_LAG = 2       # how far behind (or ahead) video_epoch and audio
 #                              # stabilizes at exactly this value (rather than growing past
 #                              # it) must still trigger the resync, or it can sit there
 #                              # forever without ever crossing a strictly-greater-than check.
-_STALL_DISC_SECS = 7.0         # (0 = off) a live window that is published more than this after the one before (windows come every 5 s; the
-#                              # audio rendition is 9-10 s late in front of every ad break, and the window waits for its audio) is flagged as
-#                              # a discontinuity, so that the decoder of the dm9xx restarts its clock with it. While the player is starved
-#                              # the decoder's clock runs on, and the window that ends the stall carries a PCR about as far behind it as the
-#                              # stall was long; the picture was distorted for a couple of seconds after it (the same decoder behaviour as
-#                              # after a jump of the timeline, see assign_live_delta). Since the flag the switches with such a stall were clean
+_EPOCH_END_HOLD_SECS = 2.0     # the last window of a content that ends at a CDN discontinuity tag is not
+#                              # put into the playlist until the first window of the next content is published, but for this long at most. The
+#                              # player polls the playlist every 5 s; a poll that fell between the two windows got the last window of the movie
+#                              # now and the first window of the ad 5 s later, and the start of that ad was distorted. Every movie -> ad switch
+#                              # whose two windows the player got in one poll was clean (5 of 5).
 _DISC_STALE_START_TOLERANCE = 45000  # 0.5 s (90 kHz ticks): the audio buffer of the epoch before a discontinuity window's own is that
 #                              # window's audio if it STARTS at the window (within this): the audio rendition did not flag the transition
 #                              # that video did (the ad pods), so the audio epoch runs one behind the video epoch and the new content is
@@ -412,6 +411,11 @@ def _patch_continuity(data: bytes, start_cc: dict) -> 'tuple[bytes, dict]':
         cc_state[pid] = new_cc
         buf[off + 3] = (buf[off + 3] & 0xF0) | new_cc
     return bytes(buf), cc_state
+
+
+def _signed_ticks(difference: int) -> int:
+    """A difference of two 33-bit timestamps as a signed number of ticks (a jump back is negative, also across the wrap)."""
+    return ((difference + (1 << 32)) & _TS_MASK) - (1 << 32)
 
 
 _WindowMeta = namedtuple('_WindowMeta', 'epoch start_pts end_pts is_disc')
@@ -910,6 +914,19 @@ def _ffmpeg_mux(video_data: bytes, audio_data: 'bytes | None' = None,
 # ── Per-channel proxy state ──────────────────────────────────────────────────
 
 
+class _LogStats:
+    """What the debug log of a channel needs to know and the proxy itself does not: when a window was published and how often Enigma2 asked
+    for it (what the player makes of the windows), when the last video and audio segment came, and when the last health line was written."""
+    __slots__ = ('published_at', 'requests', 'video_at', 'audio_at', 'health_at')
+
+    def __init__(self):
+        self.published_at: dict = {}   # chunk_seq -> time.monotonic() at which the window was published
+        self.requests: dict = {}       # chunk_seq -> how many times Enigma2 asked for it (more than 1: a retry of the player)
+        self.video_at: 'float | None' = None   # time.monotonic() of the last video / audio segment that was appended
+        self.audio_at: 'float | None' = None
+        self.health_at = 0.0           # time.monotonic() of the last health line
+
+
 class _ChannelState:
     """Holds state accumulated while proxying one live channel."""
 
@@ -926,7 +943,8 @@ class _ChannelState:
                  '_cc_resync_pending', '_last_playlist_out', '_last_segment_out',
                  '_pending_audio_floors', '_vod_complete', '_video_preload', '_video_first_playlist',
                  '_live_delta', '_live_expected', '_live_prev_end', '_live_gap',
-                 '_window_delta', '_shift_cache', '_extinf', '_disc_before', '_disc_count', '_last_cut_at')
+                 '_window_delta', '_shift_cache', '_extinf', '_disc_before', '_disc_count', '_last_cut_at',
+                 '_log_stats', '_epoch_end_hold')
 
     @property
     def headers(self) -> 'dict | None':
@@ -1049,7 +1067,10 @@ class _ChannelState:
         self._extinf: dict = {}          # chunk_seq -> the #EXTINF the live playlist declares for it, decided once (see window_durations)
         self._disc_before: dict = {}     # chunk_seq -> how many windows with a discontinuity were published before it
         self._disc_count = 0             # the windows with a discontinuity published so far
-        self._last_cut_at: 'float | None' = None   # time.monotonic() of the last live window that was cut, see _STALL_DISC_SECS
+        self._epoch_end_hold: 'list | None' = None   # [first seq, last seq, deadline, logged]: windows not yet in the playlist, see _EPOCH_END_HOLD_SECS
+        self._last_cut_at: 'float | None' = None   # time.monotonic() of the last live window that was cut
+        # For the debug log only (what the player makes of the windows: how old a window is when it asks for it, how often it asks):
+        self._log_stats = _LogStats()
         self._shift_cache: dict = {}     # chunk_seq -> (muxed bytes, shifted bytes) of the latest served
         self._video_preload: 'dict[str, Future]' = {}   # VOD start only: video segment url -> its download, started
         #                                 # by _handle_playlist while the audio is still being fetched
@@ -1138,6 +1159,50 @@ class _ChannelState:
         with self._lock:
             return self._last_requested_seq
 
+    def set_epoch_end_hold(self, first_seq: int, last_seq: int):
+        """The windows first_seq..last_seq are the last of a content that ends at a CDN discontinuity tag: keep them out of the playlist until the
+        first window of the next content is there (at most _EPOCH_END_HOLD_SECS), see advertised_seqs."""
+        with self._lock:
+            self._epoch_end_hold = [first_seq, last_seq, time.monotonic() + _EPOCH_END_HOLD_SECS, False]
+
+    def advertised_seqs(self, window_size: int, channel_id: str) -> list:
+        """The chunk_seqs that the playlist offers: the newest window_size windows, without the windows that wait for the first window of the
+        next content (set_epoch_end_hold). The caller holds self._lock."""
+        seqs = list(self._ready_segs.keys())
+        hold = self._epoch_end_hold
+        if hold is not None:
+            first, last, deadline, logged = hold
+            now = time.monotonic()
+            if last + 1 in self._ready_segs or now > deadline:
+                logger.debug('%s: Event: window(s) %s-%s were held back from the playlist for %.1f s | Action: offer them now (%s)',
+                             channel_id, first, last, now - (deadline - _EPOCH_END_HOLD_SECS),
+                             'the first window of the next content is there' if last + 1 in self._ready_segs else 'time is up')
+                self._epoch_end_hold = None
+            else:
+                older = [seq for seq in seqs if seq < first]
+                if older:
+                    if not logged:
+                        hold[3] = True
+                        logger.debug('%s: Event: window(s) %s-%s end a content (CDN discontinuity tag) | Action: hold them back from the playlist'
+                                     ' until the first window of the next content is there, %.1f s at most', channel_id, first, last,
+                                     _EPOCH_END_HOLD_SECS)
+                    return older[-window_size:]
+        return seqs[-window_size:]
+
+    def note_published(self, seq: int):
+        """Debug log: the time at which window *seq* was published (see _handle_segment's "age")."""
+        self._log_stats.published_at[seq] = time.monotonic()
+        while len(self._log_stats.published_at) > _MAX_SEG_CACHE:
+            self._log_stats.published_at.pop(next(iter(self._log_stats.published_at)))
+
+    def note_request(self, seq: int) -> int:
+        """Debug log: how many times Enigma2 has asked for window *seq* now (1 = the first time; more is a retry of the player)."""
+        count = self._log_stats.requests.get(seq, 0) + 1
+        self._log_stats.requests[seq] = count
+        while len(self._log_stats.requests) > _MAX_SEG_CACHE:
+            self._log_stats.requests.pop(next(iter(self._log_stats.requests)))
+        return count
+
     def has_ready_segs(self) -> bool:
         """True once the video prefetch loop has produced anything at all.
 
@@ -1176,10 +1241,17 @@ class _ChannelState:
         *approximate* is for a window whose PTS range is only guessed (see the standalone fallback of
         _video_prefetch_loop): it gets the shift in effect and doesn't move the expectation.
         """
+        old_delta, prev_end, expected_before = self._live_delta, self._live_prev_end, self._live_expected
         if not approximate:
             if is_disc and self._live_expected is not None:
+                # (also for a stall of the player, whose real timeline goes on as it was: the window that ends the stall is put one gap
+                # after the one before, and the decoder is better off with that small step than with none - the switches to an ad that
+                # have such a stall were clean with it, and distorted when the shift was left as it was.)
                 delta = (self._live_expected - start_pts) & _TS_MASK
                 self._live_delta = delta - (1 << 33) if delta >= 1 << 32 else delta   # signed, 33-bit
+                # The gap between two windows is a property of the content (a movie has none, the windows of an ad have 0.235 s that
+                # the cut leaves out): the new content measures its own, from the usual gap on, instead of taking over the old one's.
+                self._live_gap = _LIVE_GAP_TICKS
             elif self._live_prev_end is not None:
                 gap = (start_pts - self._live_prev_end) & _TS_MASK
                 if 0 < gap < 90000:
@@ -1195,6 +1267,15 @@ class _ChannelState:
             self._disc_count += 1
         while len(self._disc_before) > _MAX_SEG_CACHE:
             self._disc_before.pop(next(iter(self._disc_before)))
+        # What the debug log shows of the step (it is not used otherwise): the jump of the real timeline from the end of the window before
+        # to the start of this one, and what the player sees of it - the distance of the served start to the served end of the window
+        # before, which is about one frame (the gap) in a timeline that does not jump.
+        info = {'old_delta': old_delta, 'delta': self._live_delta, 'expected': expected_before, 'prev_end': prev_end,
+                'real_jump': None, 'served_gap': None}
+        if not approximate and prev_end is not None:
+            info['real_jump'] = _signed_ticks(start_pts - prev_end)
+            info['served_gap'] = _signed_ticks((start_pts + self._live_delta) - (prev_end + old_delta))
+        return info
 
     def reset_live_delta(self):
         """Forget the timeline (the cached windows are dropped, see register_channel). Lock held by the caller."""
@@ -1733,11 +1814,15 @@ def _append_audio(state: '_ChannelState', channel_id: str, seq: int, disc: bool,
         state._audio_appended_seqs = {
             s for s in state._audio_appended_seqs if s >= seq - _SEQ_REPROCESS_WINDOW
         }
+        audio_disc = None
         if disc and seq not in state._audio_disc_seqs_seen:
+            # for the debug log: where the audio before the tag ended
+            earlier_end = state._audio_bufs[0].pts_list[-1] if state._audio_bufs and state._audio_bufs[0].pts_list else None
             state._audio_epoch += 1
             for b in state._audio_bufs:
                 b.mark_closed()
             state._audio_bufs.insert(0, _RenditionBuffer(state._audio_epoch, is_disc_epoch=True))
+            audio_disc = (state._audio_epoch, state._video_epoch, earlier_end)
         state._audio_disc_seqs_seen.add(seq)
         state._audio_disc_seqs_seen = {
             s for s in state._audio_disc_seqs_seen if s >= seq - _SEQ_REPROCESS_WINDOW
@@ -1749,10 +1834,22 @@ def _append_audio(state: '_ChannelState', channel_id: str, seq: int, disc: bool,
         accepted = len(state._audio_bufs[0].pts_list) > before   # a segment that goes back in time is refused by the buffer
         epoch_now = state._audio_bufs[0].epoch
         _prune_audio_bufs(state)
+    if audio_disc is not None:
+        # The audio rendition's own tag, the counterpart of "CDN discontinuity tag" of the video loop: the epochs of the two renditions
+        # are counted separately, from their own tags, and have to stay together (see _MAX_AUDIO_EPOCH_LAG); the video epoch at this
+        # moment shows which one is ahead, and the jump shows where the audio of the new epoch starts.
+        first_pts = min(p for _, p in pts_offsets)
+        logger.debug('%s/%s: Event: audio CDN discontinuity tag | Action: audio_epoch -> %s (video_epoch=%s), the audio before it ended'
+                     ' at pts=%s, this segment starts at %s (%s)', channel_id, seq, audio_disc[0], audio_disc[1],
+                     audio_disc[2] if audio_disc[2] is not None else '-', first_pts,
+                     f'{_signed_ticks(first_pts - audio_disc[2]) / 90000.0:+.3f}s' if audio_disc[2] is not None else 'first audio')
     # where each audio segment starts, to compare with the video segments (see the matching line of _video_prefetch_loop)
-    logger.debug('%s/%s: audio segment pts=[%s,%s] frames=%s disc=%s epoch=%s %s', channel_id, seq,
+    appended_at = time.monotonic()
+    logger.debug('%s/%s: audio segment pts=[%s,%s] frames=%s disc=%s epoch=%s %s since_prev=%s bytes=%s', channel_id, seq,
                  min(p for _, p in pts_offsets), max(p for _, p in pts_offsets), len(pts_offsets), disc, epoch_now,
-                 'appended' if accepted else 'REFUSED (goes back in time)')
+                 'appended' if accepted else 'REFUSED (goes back in time)',
+                 f'{appended_at - state._log_stats.audio_at:.2f}s' if state._log_stats.audio_at is not None else '-', len(data))
+    state._log_stats.audio_at = appended_at
 
 
 def _slice_audio_for_window(state: '_ChannelState', epoch: int, start_pts: int, end_pts: int,
@@ -1941,9 +2038,13 @@ def _cut_and_mux_next_window(channel_id: str, state: '_ChannelState') -> bool:
         return False
 
     is_disc = vbuf.is_disc_epoch and not vbuf.first_window_emitted
+    # Why the window is flagged, for the debug log: the first window of an epoch (the CDN's tag, or a buffer that was started over),
+    # the first one after a jump that no tag announced
+    disc_reasons = ['new-epoch'] if is_disc else []
     # the first window after a jump of the timeline that no tag announced is a real transition too
     if vbuf.disc_pending or vbuf.jump_skipped:
         is_disc = True
+        disc_reasons.append('unflagged-jump')
         logger.debug('%s: Event: window starts after an unflagged jump of the video timeline | Action: flag it as a discontinuity',
                      channel_id)
     vbuf.disc_pending = vbuf.jump_next_pts is not None
@@ -1952,21 +2053,17 @@ def _cut_and_mux_next_window(channel_id: str, state: '_ChannelState') -> bool:
                      channel_id, actual_end, vbuf.jump_next_pts)
     vbuf.first_window_emitted = True
 
+    audio_started = time.monotonic()
     aslice, a_pts, covered = _slice_audio_for_window(
         state, vbuf.epoch, actual_start, actual_end, is_disc_window=is_disc,
         wait_secs=(_DISC_AUDIO_PEEK_WAIT if is_disc else None),
         channel_id=channel_id)
 
-    # A window that comes long after the one before (the player ran dry), see _STALL_DISC_SECS. Measured here, after the wait for
-    # the audio: the video of such a window is usually there long before (the video loop has fetched well ahead), it is the audio
-    # rendition that comes late, and the window is published only when its audio has arrived.
+    # When the window is published, and how long it waited for its audio (for the window line of the debug log)
     now = time.monotonic()
+    audio_wait = now - audio_started
     last_cut_at = state._last_cut_at
     state._last_cut_at = now
-    if _STALL_DISC_SECS > 0 and not is_disc and last_cut_at is not None and now - last_cut_at > _STALL_DISC_SECS:
-        is_disc = True
-        logger.debug('%s: Event: window published %.1f s after the one before (stall) | Action: flag it as a discontinuity',
-                     channel_id, now - last_cut_at)
 
     # reset_cc honors a pending late-audio-upgrade resync (see
     # _resolve_late_audio_window) - kept separate from is_disc itself so a
@@ -1977,23 +2074,55 @@ def _cut_and_mux_next_window(channel_id: str, state: '_ChannelState') -> bool:
         if state._cc_resync_pending:
             reset_cc = True
             state._cc_resync_pending = False
+    mux_started = time.monotonic()
     muxed = _ffmpeg_mux(vslice, aslice, state, is_disc=is_disc, track_cc=True, reset_cc=reset_cc,
                         v_pts=actual_start, a_pts=a_pts)
+    mux_secs = time.monotonic() - mux_started
 
     with state._lock:
         chunk_seq = state._next_chunk_seq
         state._next_chunk_seq += 1
         state._ready_segs[chunk_seq] = muxed
         state._window_meta[chunk_seq] = _WindowMeta(vbuf.epoch, actual_start, actual_end, is_disc)
-        state.assign_live_delta(chunk_seq, actual_start, actual_end, is_disc)
+        step = state.assign_live_delta(chunk_seq, actual_start, actual_end, is_disc)
         while len(state._ready_segs) > _MAX_SEG_CACHE:
             k, _ = state._ready_segs.popitem(last=False)
             state._window_meta.pop(k, None)
+        ring_windows = len(state._ready_segs)
+        window_delta = state._window_delta.get(chunk_seq)
+        if is_disc:
+            audio_buffers = [(buf.epoch, buf.pts_list[0], buf.pts_list[-1]) for buf in state._audio_bufs if buf.pts_list]
+    state.note_published(chunk_seq)
 
     logger.debug('%s/%s: Event: window cut epoch=%s pts=[%s,%s) is_disc=%s audio_covered=%s'
                  ' | Action: mux (%s bytes)',
                  channel_id, chunk_seq, vbuf.epoch, actual_start, actual_end, is_disc, covered,
                  len(muxed))
+    # One line with what to look at when a window is a hiccup: how long it is, what went into it, how long the mux took, how long after the
+    # window before it, where the audio starts compared to the video (a_off), the number of windows in the ring and the shift of the
+    # timeline that Enigma2 gets (delta, and gap to the window before).
+    # disc: why the window is flagged as a discontinuity (-: it is not), served_gap: the distance on the timeline that Enigma2 gets from
+    # the end of the window before to the start of this one (about one frame, +33ms, if the timeline does not jump)
+    logger.debug('%s/%s: window: media=%.3fs video=%s audio=%s mux=%.2fs out=%s since_prev=%s a_off=%s ring=%s delta=%s gap=%s'
+                 ' disc=%s served_gap=%s audio_wait=%.2fs',
+                 channel_id, chunk_seq, (actual_end - actual_start) / 90000.0, len(vslice), len(aslice) if aslice else 0, mux_secs,
+                 len(muxed), f'{now - last_cut_at:.2f}s' if last_cut_at is not None else '-',
+                 f'{(a_pts - actual_start) / 90.0:+.0f}ms' if a_pts is not None else '-', ring_windows, window_delta, state._live_gap,
+                 ','.join(disc_reasons) or '-',
+                 f"{step['served_gap'] / 90.0:+.0f}ms" if step['served_gap'] is not None else '-', audio_wait)
+    if is_disc:
+        # Everything at one place for a transition (the lines of the two renditions, the audio and the timeline are far apart in the log
+        # otherwise): what the real timeline did, what the shift made of it, and what audio the window got from which epoch.
+        logger.debug('%s/%s: DISC: reason=%s video_epoch=%s audio_epoch=%s audio_covered=%s | real timeline: previous window ended at %s,'
+                     ' this one starts at %s (%s) | served timeline: %s, expected start %s, served gap %s |'
+                     ' audio buffers (epoch first..last) [%s] | transitions so far %s',
+                     channel_id, chunk_seq, ','.join(disc_reasons) or '-', vbuf.epoch, state.current_audio_epoch(), covered,
+                     step['prev_end'] if step['prev_end'] is not None else '-', actual_start,
+                     f"{step['real_jump'] / 90000.0:+.3f}s" if step['real_jump'] is not None else 'first window',
+                     f"delta {step['old_delta']} -> {step['delta']}",
+                     step['expected'] if step['expected'] is not None else '-',
+                     f"{step['served_gap'] / 90.0:+.0f}ms" if step['served_gap'] is not None else '-',
+                     ' '.join(f'e{epoch}:{first}..{last}' for epoch, first, last in audio_buffers), state._disc_count)
 
     if not covered:
         state.mark_provisional(chunk_seq)
@@ -2736,8 +2865,14 @@ def _video_prefetch_loop(channel_id: str, state: '_ChannelState',
                 # already fully cut into its own window immediately below),
                 # kept as a defensive flush in case anything was ever left
                 # pending.
+                flush_first_seq = state._next_chunk_seq
                 while _cut_and_mux_next_window(channel_id, state):
                     pass
+                last_seq = state._next_chunk_seq - 1
+                if not is_vod and last_seq in state._ready_segs:
+                    # The last window of the old content (cut when its segment arrived, a moment before this tag was handled, or in the flush
+                    # just above): the player gets it together with the first window of the new content, see _EPOCH_END_HOLD_SECS
+                    state.set_epoch_end_hold(min(flush_first_seq, last_seq), last_seq)
                 # Pick up any resync _cut_and_mux_next_window may have just
                 # applied while flushing (see _MAX_AUDIO_EPOCH_LAG) - it
                 # updates state._video_epoch directly, which this loop's own
@@ -2749,6 +2884,7 @@ def _video_prefetch_loop(channel_id: str, state: '_ChannelState',
                 state._video_buf = _RenditionBuffer(video_epoch, is_disc_epoch=True)
                 state._video_cursor_pts = None
 
+            fetch_started = time.monotonic()
             preload = state._video_preload.pop(url, None)
             vdata = preload.result() if preload is not None else None   # started at the first playlist request
             if not vdata:
@@ -2756,6 +2892,7 @@ def _video_prefetch_loop(channel_id: str, state: '_ChannelState',
                                tag='video-prefetch:segment', headers=state.headers)
             if not vdata:
                 continue
+            fetch_secs = time.monotonic() - fetch_started   # for the debug log
 
             key_url = all_key_urls[i] if i < len(all_key_urls) else None
             iv_explicit = all_ivs[i] if i < len(all_ivs) else None
@@ -2892,9 +3029,15 @@ def _video_prefetch_loop(channel_id: str, state: '_ChannelState',
 
             before = len(vbuf.pts_list)
             vbuf.append(vdata, pts_offsets, pat_pmt)
-            logger.debug('%s/%s: video segment pts=[%s,%s] frames=%s is_disc=%s epoch=%s %s', channel_id, seq,
+            # fetch: how long the CDN needed for it, since_prev: the distance to the video segment before it (the CDN publishes every
+            # 5 s: more is a late segment, and the window after it comes late too), bytes: its size
+            appended_at = time.monotonic()
+            logger.debug('%s/%s: video segment pts=[%s,%s] frames=%s is_disc=%s epoch=%s %s fetch=%.2fs since_prev=%s bytes=%s',
+                         channel_id, seq,
                          min(p for _, p in pts_offsets), max(p for _, p in pts_offsets), len(pts_offsets), is_disc, vbuf.epoch,
-                         'appended' if len(vbuf.pts_list) > before else 'REFUSED (goes back in time)')
+                         'appended' if len(vbuf.pts_list) > before else 'REFUSED (goes back in time)', fetch_secs,
+                         f'{appended_at - state._log_stats.video_at:.2f}s' if state._log_stats.video_at is not None else '-', len(vdata))
+            state._log_stats.video_at = appended_at
             if state._video_cursor_pts is None:
                 state._video_cursor_pts = v_pts
 
@@ -3192,6 +3335,30 @@ _IDLE_TIMEOUT = 60.0   # seconds of no HTTP request before an unreferenced chann
 #                      # close_channel itself (e.g. a recording simply ending, or a
 #                      # zap that for some reason missed the explicit live-slot close)
 _REAP_INTERVAL = 15.0  # how often the reaper scans for idle channels
+_HEALTH_INTERVAL = 60.0  # seconds between two "health" lines of a channel in the debug log (see _log_health)
+
+
+def _log_health(channel_id: str, state: '_ChannelState', now: float):
+    """Once a minute in the debug log: what the proxy holds in memory and how busy the process is, to see in a long run what grows (the
+    windows of the ring, the buffers of the video and the audio) and how many threads there are. Written from the request of a playlist,
+    which comes every few seconds while the channel is played."""
+    if now - state._log_stats.health_at < _HEALTH_INTERVAL:
+        return
+    state._log_stats.health_at = now
+    with state._lock:
+        ring_windows = len(state._ready_segs)
+        ring_bytes = sum(len(window) for window in state._ready_segs.values())
+        audio = ' '.join(f'e{buf.epoch}:{len(buf.data) / 1048576:.1f}' for buf in state._audio_bufs)
+    video = state._video_buf
+    rss = '-'
+    try:
+        with open('/proc/self/statm', encoding='ascii') as statm:
+            rss = str(int(statm.read().split()[1]) * os.sysconf('SC_PAGE_SIZE') // 1048576)
+    except (OSError, ValueError, IndexError):
+        pass
+    logger.debug('%s: health: ring=%s windows %.1f MB, video buffer %.1f MB epoch %s, audio buffers MB [%s], threads=%s, process rss=%s MB',
+                 channel_id, ring_windows, ring_bytes / 1048576, len(video.data) / 1048576 if video is not None else 0.0,
+                 video.epoch if video is not None else '-', audio, threading.active_count(), rss)
 
 
 def _reap_idle_channels():
@@ -3778,28 +3945,32 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
         # #EXT-X-KEY is dropped unconditionally - the proxy always decrypts
         # before serving, so hlsdemux must never attempt a second
         # decryption pass on the cleartext output.
+        dropped_prefixes = (
+            '#EXT-X-KEY:',
+            '#EXT-X-MEDIA-SEQUENCE:',
+            '#EXTINF:',
+            # A VOD source's own manifest carries #EXT-X-PLAYLIST-TYPE:VOD
+            # and/or #EXT-X-ENDLIST - copying either straight through
+            # tells GStreamer's hlsdemux "this is the complete asset",
+            # taking whatever partial window this proxy has advertised
+            # so far (often just one chunk, this early in production) at
+            # face value as the *entire* movie. Confirmed in production:
+            # playback stops dead after exactly that one chunk, with no
+            # further playlist re-poll, because there was never a
+            # correctness reason for hlsdemux to ask for more. A live
+            # CDN playlist never carries either tag to begin with, so
+            # stripping them here is a no-op there.
+            '#EXT-X-PLAYLIST-TYPE:',
+        )
+        dropped_lines = ('#EXT-X-DISCONTINUITY', '#EXT-X-ENDLIST')
+        # the CDN's count of its own transitions does not belong to the tags of this playlist (see _EXACT_EXTINF)
+        drop_disc_seq = _EXACT_EXTINF and not channel_id.startswith('vod')
         out = []
         for line in vtext.splitlines():
             stripped = line.strip()
-            if (stripped.startswith('#EXT-X-KEY:')
-                    or stripped == '#EXT-X-DISCONTINUITY'
-                    or stripped.startswith('#EXT-X-MEDIA-SEQUENCE:')
-                    or stripped.startswith('#EXTINF:')
-                    # the CDN's count of its own transitions does not belong to the tags of this playlist (see _EXACT_EXTINF)
-                    or (_EXACT_EXTINF and not channel_id.startswith('vod') and stripped.startswith('#EXT-X-DISCONTINUITY-SEQUENCE:'))
-                    # A VOD source's own manifest carries #EXT-X-PLAYLIST-TYPE:VOD
-                    # and/or #EXT-X-ENDLIST - copying either straight through
-                    # tells GStreamer's hlsdemux "this is the complete asset",
-                    # taking whatever partial window this proxy has advertised
-                    # so far (often just one chunk, this early in production) at
-                    # face value as the *entire* movie. Confirmed in production:
-                    # playback stops dead after exactly that one chunk, with no
-                    # further playlist re-poll, because there was never a
-                    # correctness reason for hlsdemux to ask for more. A live
-                    # CDN playlist never carries either tag to begin with, so
-                    # stripping them here is a no-op there.
-                    or stripped.startswith('#EXT-X-PLAYLIST-TYPE:')
-                    or stripped == '#EXT-X-ENDLIST'
+            if (stripped.startswith(dropped_prefixes)
+                    or stripped in dropped_lines
+                    or (drop_disc_seq and stripped.startswith('#EXT-X-DISCONTINUITY-SEQUENCE:'))
                     or (stripped and not stripped.startswith('#'))):
                 continue
             out.append(line)
@@ -3809,7 +3980,7 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
         # window, not this proxy's full _MAX_SEG_CACHE-bounded history.
         window_size = max(1, len(vsegs))
         with state._lock:
-            advertise_seqs = list(state._ready_segs.keys())[-window_size:]
+            advertise_seqs = state.advertised_seqs(window_size, channel_id)
             window_meta = dict(state._window_meta)
             window_delta = {seq: state._window_delta.get(seq, 0) for seq in advertise_seqs}
             disc_before = state._disc_before.get(advertise_seqs[0]) if advertise_seqs else None
@@ -3880,6 +4051,19 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             # stream, right after the full asset had been produced).
             out.append('#EXT-X-ENDLIST')
 
+        if advertise_seqs:
+            now = time.monotonic()
+            published = state._log_stats.published_at.get(advertise_seqs[-1])
+            disc_windows = [s for s in advertise_seqs if s in window_meta and window_meta[s].is_disc]
+            # disc_seq: the #EXT-X-DISCONTINUITY-SEQUENCE that it declares (the number of the transitions in front of its first window),
+            # disc_at: the windows that have a #EXT-X-DISCONTINUITY tag in front of them
+            logger.debug('%s: playlist offered: segments %s-%s (%d), newest published %s ago, discontinuities %d (windows %s), disc_seq=%s, built in %.2fs',
+                         channel_id, advertise_seqs[0], advertise_seqs[-1], len(advertise_seqs),
+                         f'{now - published:.1f}s' if published is not None else '-',
+                         len(disc_windows), ','.join(str(s) for s in disc_windows) or '-', disc_before if disc_before is not None else '-',
+                         now - t_begin)
+            _log_health(channel_id, state, now)
+
         out_bytes = '\n'.join(out).encode()
         state._last_playlist_out[idx] = (out_bytes, time.monotonic())
         self._send(200, out_bytes, 'application/x-mpegURL')
@@ -3893,6 +4077,8 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             return
 
         state.record_segment_request(seq)
+        asked_at = time.monotonic()
+        asked_n = state.note_request(seq)
         if channel_id.startswith('vod'):
             state.evict_played(_VOD_KEEP_BEHIND_SEGMENTS)
 
@@ -3926,7 +4112,7 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                 muxed = state._ready_segs.get(seq)
                 provisional = seq in state._provisional_segs
             if muxed is not None and not provisional:
-                logger.debug('%s/%s: cache hit %s bytes', channel_id, seq, len(muxed))
+                logger.debug('%s/%s: cache hit %s bytes%s', channel_id, seq, len(muxed), self._request_info(state, seq, asked_at, asked_n))
                 out = state.timeline_adjusted(seq, muxed)
                 state._last_segment_out = (seq, out)
                 self._send(200, out, 'video/MP2T')
@@ -3942,8 +4128,8 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             # version as a last resort rather than re-fetching/re-muxing on
             # demand below, which would just repeat the same full-budget
             # search _resolve_late_audio already ran and lost.
-            logger.debug('%s/%s: cache hit %s bytes (provisional, upgrade never landed)',
-                         channel_id, seq, len(provisional_fallback))
+            logger.debug('%s/%s: cache hit %s bytes (provisional, upgrade never landed)%s',
+                         channel_id, seq, len(provisional_fallback), self._request_info(state, seq, asked_at, asked_n))
             out = state.timeline_adjusted(seq, provisional_fallback)
             state._last_segment_out = (seq, out)
             self._send(200, out, 'video/MP2T')
@@ -3970,8 +4156,8 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                 muxed = state._ready_segs.get(seq)
                 provisional = seq in state._provisional_segs
             if muxed is not None and not provisional:
-                logger.debug('%s/%s: cache hit %s bytes (after extended wait)',
-                             channel_id, seq, len(muxed))
+                logger.debug('%s/%s: cache hit %s bytes (after extended wait)%s',
+                             channel_id, seq, len(muxed), self._request_info(state, seq, asked_at, asked_n))
                 out = state.timeline_adjusted(seq, muxed)
                 state._last_segment_out = (seq, out)
                 self._send(200, out, 'video/MP2T')
@@ -3981,6 +4167,25 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
         if self._serveLastSegment(state, channel_id, seq, 'chunk never produced'):
             return
         self._send(404, b'Segment not in cache', 'text/plain')
+
+    @staticmethod
+    def _request_info(state, seq, asked_at, asked_n):
+        """The end of a "cache hit" line, what the player's request tells about its buffer: age (how long ago the window was published: a
+        small number means the player has no more than that in hand), newer (how many windows were already published after it, the
+        player's distance from the live edge), request (the n-th time that Enigma2 asks for this window: more than 1 is a retry,
+        which follows a stall of the player) and waited (how long this request had to wait for the window, it is only there if it did)."""
+        now = time.monotonic()
+        with state._lock:
+            newest = next(reversed(state._ready_segs), seq)
+        published = state._log_stats.published_at.get(seq)
+        text = f' age={asked_at - published:.2f}s' if published is not None else ' age=-'
+        text += f' newer={max(0, newest - seq)} request={asked_n}'
+        meta = state._window_meta.get(seq)
+        if meta is not None and meta.is_disc:
+            text += ' disc'   # the window that Enigma2 gets has a discontinuity tag in front of it: what it does around this one is of interest
+        if now - asked_at >= 0.1:
+            text += f' waited={now - asked_at:.2f}s'
+        return text
 
     def _serveLastSegment(self, state, channel_id, seq, reason):
         """Re-serve the last segment actually sent to Enigma2, in place of a
