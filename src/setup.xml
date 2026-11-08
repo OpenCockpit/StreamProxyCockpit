@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--suppress XmlUnboundNsPrefix -->
+<setupxml>
+	<setup key="streamproxycockpit" title="Setup">
+		<item level="2" text="Log level" description="Select debug log level.">config.plugins.streamproxycockpit.debug_log_level</item>
+	</setup>
+</setupxml>
