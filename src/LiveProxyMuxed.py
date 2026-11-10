@@ -13,8 +13,9 @@
 #   This module puts the same treatment between the CDN and Enigma2 that LiveProxyUnmuxed gives a demuxed stream:
 #
 #   - one poller thread per channel (_MuxedChannel) follows the media playlist, fetches (and decrypts) every
-#     segment once and remuxes it with ffmpeg (stream copy), so the PIDs and PAT/PMT are the same wherever a
-#     piece came from, an ad with a different layout included;
+#     segment once and gives it the PIDs and PAT/PMT of the first one (TSRemap rewrites them and nothing else; only what
+#     it can't handle is remuxed with ffmpeg), so they are the same wherever a piece came from, an ad with a
+#     different layout included;
 #   - after a discontinuity the timeline (PCR/PTS/DTS) continues where the previous segment ended instead of
 #     jumping (_rewrite_timeline, the same approach as RecordingProxyUnmuxed), and the continuity counters are chained
 #     over all segments (_patch_continuity);
@@ -43,6 +44,7 @@ from .Debug import logger
 from .HLSParser import HLSPlaylist
 from .LiveProxyUnmuxed import PROXY_HOST, PROXY_PORT, _FFMPEG, _FFMPEG_TIMEOUT, _fetch, _first_pts, _patch_continuity, _redact, resolved_master_url
 from .RecordingProxyUnmuxed import _PTS_MASK, _rewrite_timeline, _segment_is_disc
+from .TSRemap import remap_pids
 
 _START_BACK_SEGMENTS = 3       # a channel starts at least this many segments before the live edge (hlsdemux does too)
 _START_BACK_SECONDS = 9.0      # ... and at least this much content: three 1s segments are no cushion against a CDN that stalls for 4-7s
@@ -547,7 +549,8 @@ class _MuxedChannel:
         self._lost = False                            # a segment was lost: treat the next one as a discontinuity
         self._warned_ffmpeg = False
         self._raw_layout = None        # PID layout of the first segment, served unchanged while the others match it
-        self._normalize_all = False    # a segment had another layout: remux every one from then on
+        self._normalize_all = False    # a segment had no readable PAT/PMT: remux every one from then on
+        self._remapped_from = None     # the layout that was last logged as given the PIDs of the first one
         self._last_playlist = -math.inf               # when a playlist was last asked for
         self._hold_until = 0.0                        # until when the newest segments are held back from it
         self._start_target = 1                        # segments in the ring before the channel counts as ready
@@ -827,9 +830,14 @@ class _MuxedChannel:
         return None
 
     def _normalize(self, data: bytes) -> bytes:
-        """Remux (stream copy) so the PIDs/PAT/PMT are the same for every segment, whatever the source layout.
+        """Give every segment the PIDs/PAT/PMT of the first one, whatever the source layout.
 
-        -pes_payload_size 0 gives every audio frame its own PES packet and PTS, like the source segments; the muxer's
+        A segment with another layout (the clips of an ad break have PIDs of their own) gets the PIDs of the first one by
+        TSRemap.remap_pids, which changes nothing else: the PES packets, the PCR and the timestamps stay as the CDN made them,
+        like those of the segments that need no change. Only a segment that can't be handled in this way (no audio where the
+        first one had it, the PCR on a stream that is dropped, no readable PAT/PMT) is remuxed with ffmpeg.
+
+        What the ffmpeg remux does: -pes_payload_size 0 gives every audio frame its own PES packet and PTS, like the source segments; the muxer's
         default packs about 11 frames (235 ms) under one PTS, which the Dreambox's audio decoder played at a different
         offset from the picture (seen on the unmuxed Pluto path, see LiveProxyUnmuxed._ffmpeg_mux).
 
@@ -837,7 +845,12 @@ class _MuxedChannel:
         instead of the source's 1.0 s behind the PTS): Hogan's Heroes played extremely out of sync through it, direct
         playback of the same segments in sync. As long as every segment has the PID layout of the first one, the
         segments are therefore served as they came from the CDN (only the timeline and continuity counters are
-        continued afterwards, see _continuize)."""
+        continued afterwards, see _continuize).
+
+        Remuxing every segment once the layout had changed (the first ad break of a channel) lost the sync for the rest of
+        the channel (The Love Boat, 16:29 on: in the recording the PCR 0.7-0.93 s behind the PTS every 100 ms, 1.0-1.17 s
+        every 33 ms before), which is why the PIDs are rewritten instead. For the segments that still go through ffmpeg
+        -muxdelay 1.0 -pcr_period 33 give the PCR the timing of the Pluto segments (measured: 1.0-1.17 s, every 33 ms)."""
         if _PASSTHROUGH and not self._normalize_all:
             layout = _stream_layout(data)
             if layout is not None:
@@ -846,12 +859,20 @@ class _MuxedChannel:
                     logger.debug('%s: stream layout %s | Action: segments are served unchanged', self.channel_id, layout)
                 if layout == self._raw_layout:
                     return data
-                logger.debug('%s: stream layout changed %s -> %s | Action: every segment is remuxed from now on',
-                             self.channel_id, self._raw_layout, layout)
-            self._normalize_all = True
+                remapped = remap_pids(data, layout, self._raw_layout, _VIDEO_STREAM_TYPES, _AUDIO_STREAM_TYPES)
+                if remapped is not None:
+                    if layout != self._remapped_from:
+                        self._remapped_from = layout
+                        logger.debug('%s: stream layout %s differs from %s | Action: PIDs and PAT/PMT rewritten, the rest of the segment '
+                                     'as the CDN made it', self.channel_id, layout, self._raw_layout)
+                    return remapped
+                logger.debug('%s: stream layout %s differs from %s and its PIDs can not be rewritten | Action: this segment is remuxed',
+                             self.channel_id, layout, self._raw_layout)
+            else:
+                self._normalize_all = True
         cmd = [_FFMPEG, '-loglevel', 'error', '-probesize', '1000000', '-analyzeduration', '2000000', '-i', 'pipe:0',
                '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', '-copyts', '-f', 'mpegts', '-pes_payload_size', '0',
-               '-pat_period', '2'] + _remux_pid_args(self._raw_layout) + ['pipe:1']
+               '-muxdelay', '1.0', '-pcr_period', '33', '-pat_period', '2'] + _remux_pid_args(self._raw_layout) + ['pipe:1']
         try:
             r = subprocess.run(cmd, input=data, capture_output=True, timeout=_FFMPEG_TIMEOUT, check=False)
             if r.returncode == 0 and r.stdout:
