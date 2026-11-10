@@ -51,10 +51,14 @@
 
 import threading
 import time
+from collections import OrderedDict, deque
 from queue import Queue, Full, Empty
+from urllib.parse import urljoin
+
+import requests
 
 from .Debug import logger
-from .LiveProxyUnmuxed import _ensure_pipeline, _get_state, _first_pts, recording_client
+from .LiveProxyUnmuxed import _ensure_pipeline, _get_state, _first_pts, recording_client, PROXY_HOST, PROXY_PORT
 
 _POLL_INTERVAL = 0.1
 _QUEUE_MAXSIZE = 64  # bounds memory if the HTTP client reads slower than segments arrive
@@ -326,6 +330,159 @@ class RecordingSession:
         self._feeder_thread.join(timeout=5)
 
 
+_VOD_PLAYLIST_TIMEOUT = 60   # s; the first playlist of an asset waits for its cold start
+_VOD_SEGMENT_TIMEOUT = 30    # s
+_VOD_POLL_INTERVAL = 0.5     # s between two polls of a playlist that has nothing new
+_VOD_STALL_TIMEOUT = 120     # s without a new segment (and no end of the asset) before the recording gives up
+_VOD_SEGMENT_ATTEMPTS = 3
+_vod_completed = deque(maxlen=64)   # channels whose asset was recorded to its end
+_vod_written = OrderedDict()        # channel_id -> seconds of the asset written to the recording so far
+_VOD_WRITTEN_KEEP = 64
+
+
+def vod_recording_complete(channel_id):
+    """True if the recording of the VOD asset *channel_id* has been written to its end (a file that is played while it
+    is recorded is not at its end before)."""
+    return channel_id in _vod_completed
+
+
+def vod_recording_seconds(channel_id):
+    """How many seconds of the VOD asset *channel_id* have been written to its recording (what a player shows as the
+    progress of the recording: the file is written much faster than it plays)."""
+    return _vod_written.get(channel_id, 0.0)
+
+
+def _vod_parse_playlist(text, playlist_url):
+    """(media sequence, [segment address], [segment duration in s], ended) of the media playlist *text*."""
+    media_seq = 0
+    segments = []
+    durations = []
+    duration = 0.0
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith('#EXT-X-MEDIA-SEQUENCE:'):
+            try:
+                media_seq = int(line.split(':', 1)[1])
+            except ValueError:
+                pass
+        elif line.startswith('#EXTINF:'):
+            try:
+                duration = float(line.split(':', 1)[1].split(',', 1)[0])
+            except ValueError:
+                duration = 0.0
+        elif line and not line.startswith('#'):
+            segments.append(urljoin(playlist_url, line))
+            durations.append(duration)
+            duration = 0.0
+    return media_seq, segments, durations, '#EXT-X-ENDLIST' in text
+
+
+def _vod_media_playlist_url(text, playlist_url):
+    """The address of the media playlist to follow: the first variant of a master playlist, *playlist_url* itself if
+    *text* is already a media playlist."""
+    lines = [line.strip() for line in text.splitlines()]
+    for i, line in enumerate(lines):
+        if line.startswith('#EXT-X-STREAM-INF:'):
+            for uri in lines[i + 1:]:
+                if uri and not uri.startswith('#'):
+                    return urljoin(playlist_url, uri)
+    return playlist_url
+
+
+def _vod_get(session, url, timeout):
+    response = session.get(url, timeout=timeout)
+    response.raise_for_status()
+    return response
+
+
+def _record_vod(handler, channel_id):
+    """Serve /rec/{channel_id}.ts of a VOD asset: the whole asset from its first segment on, as fast as the proxy
+    produces it, ending with the asset.
+
+    A VOD channel is not a live one that RecordingSession could follow from the live edge: its segments are produced
+    from the start of the asset, paced to what a player has asked for (_PREFETCH_LEAD_SEGMENTS), and the end is
+    announced with #EXT-X-ENDLIST. All of that is what the proxy's own HLS handlers do for a player, so this plays the
+    player: it takes the playlist of /auto/{channel_id}.m3u8 and the segments from it, in order and without waiting
+    for a play clock, and writes them to the response. The cold start of the asset (audio head start, preloaded video),
+    the pacing (the requests move it on), the timeline (never jumps, see _ChannelState.timeline_adjusted) and the end
+    are those of the HLS handlers, nothing is done twice.
+
+    Nothing is sent before the first segment is in, so a recorder gets an error status, not an empty file, if the
+    asset can't be played (then the caller plays it as HLS)."""
+    if channel_id in _vod_completed:
+        # Enigma2's recorder takes the end of the stream for an interruption and connects again, to a new file
+        # (<name>_001.ts): the asset must not be recorded a second time.
+        logger.debug('%s: VOD recording asked for again after it was complete, 410', channel_id)
+        handler.send_response(410)
+        handler.end_headers()
+        return
+    base = f'http://{PROXY_HOST}:{PROXY_PORT}'
+    session = requests.Session()
+    session.trust_env = False   # a proxy of the environment has no business on the loopback
+    started = False
+    written = 0
+    try:
+        master = _vod_get(session, f'{base}/auto/{channel_id}.m3u8', _VOD_PLAYLIST_TIMEOUT)
+        playlist_url = _vod_media_playlist_url(master.text, master.url)
+        logger.debug('%s: VOD recording follows %s', channel_id, playlist_url)
+        next_seq = None
+        last_progress = time.monotonic()
+        while True:
+            media_seq, segments, durations, ended = _vod_parse_playlist(
+                _vod_get(session, playlist_url, _VOD_PLAYLIST_TIMEOUT).text, playlist_url)
+            if next_seq is None:
+                next_seq = media_seq
+            elif media_seq > next_seq:
+                # the playlist is a window and this recording fell out of it (a stall of this thread): the segments
+                # in between are gone
+                logger.debug('%s: VOD recording fell behind the playlist window, segments %s-%s skipped',
+                             channel_id, next_seq, media_seq - 1)
+                next_seq = media_seq
+            fresh = [(media_seq + i, url, durations[i]) for i, url in enumerate(segments) if media_seq + i >= next_seq]
+            for seq, url, duration in fresh:
+                data = None
+                for attempt in range(_VOD_SEGMENT_ATTEMPTS):
+                    try:
+                        data = _vod_get(session, url, _VOD_SEGMENT_TIMEOUT).content
+                        break
+                    except requests.RequestException as exc:
+                        logger.debug('%s: VOD recording: segment %s attempt %s failed: %s', channel_id, seq, attempt + 1, exc)
+                        time.sleep(1.0)
+                if data is None:
+                    raise RuntimeError(f'segment {seq} is not available')
+                if not started:
+                    handler.send_response(200)
+                    handler.send_header('Content-Type', 'video/MP2T')
+                    handler.end_headers()
+                    started = True
+                handler.wfile.write(data)
+                written += len(data)
+                _vod_written[channel_id] = _vod_written.get(channel_id, 0.0) + duration
+                while len(_vod_written) > _VOD_WRITTEN_KEEP:
+                    _vod_written.popitem(last=False)
+                next_seq = seq + 1
+                last_progress = time.monotonic()
+            if fresh:
+                continue   # ask again at once: the player this stands in for would
+            if ended:
+                _vod_completed.append(channel_id)
+                logger.debug('%s: VOD recording complete, segments up to %s written, %.1f MB',
+                             channel_id, next_seq - 1, written / 1048576.0)
+                return
+            if time.monotonic() - last_progress > _VOD_STALL_TIMEOUT:
+                raise RuntimeError(f'no new segment for {_VOD_STALL_TIMEOUT}s')
+            time.sleep(_VOD_POLL_INTERVAL)
+    except (BrokenPipeError, ConnectionResetError):
+        logger.debug('%s: VOD recording stopped by the recorder after %.1f MB', channel_id, written / 1048576.0)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.debug('%s: VOD recording failed: %s', channel_id, exc)
+        if not started:
+            handler.send_response(502)
+            handler.end_headers()
+    finally:
+        session.close()
+
+
 def handle_recording(handler, channel_id):
     """Serve /rec/{channel_id}.ts on the given BaseHTTPRequestHandler.
 
@@ -349,6 +506,9 @@ def handle_recording(handler, channel_id):
     # Counted for the whole connection so StreamProxy.playServiceExtension does not close the channel
     # under a recorder that is not a record timer (e.g. TimeshiftCockpit) when the live slot moves on.
     with recording_client(channel_id):
+        if channel_id.startswith('vod'):
+            _record_vod(handler, channel_id)
+            return
         # Recording connects straight here, never through /master or /pl, so
         # unlike live playback nothing else guarantees the prefetch threads
         # that fill state._ready_segs are running - see _ensure_pipeline.

@@ -146,6 +146,19 @@ def live_channel_id():
     return _live_channel_id
 
 
+def vod_recording_complete(channel_id):
+    """True if the recording of a VOD asset (/rec/ of a channel whose id starts with "vod") has been written to its
+    end. Until then a file that is played while it is recorded has more to come."""
+    from . import RecordingProxyUnmuxed  # deferred: it imports from LiveProxyUnmuxed
+    return RecordingProxyUnmuxed.vod_recording_complete(channel_id)
+
+
+def vod_recording_seconds(channel_id):
+    """How many seconds of a VOD asset have been written to its recording so far (see vod_recording_complete)."""
+    from . import RecordingProxyUnmuxed  # deferred: it imports from LiveProxyUnmuxed
+    return RecordingProxyUnmuxed.vod_recording_seconds(channel_id)
+
+
 def _timerRecords(nav, channel_id):
     """True if a currently running, non-justplay record timer (an instant recording is one too) targets *channel_id*."""
     for timer in nav.RecordTimer.timer_list:
