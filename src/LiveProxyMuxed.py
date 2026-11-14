@@ -480,27 +480,128 @@ def _insert_silence(ts: bytes, apid: int, first_pts: int, frame_ticks: int, coun
     return ts[:off] + packets + ts[off:]
 
 
-def _drop_early_audio(ts: bytes, apid: int, limit: int) -> 'tuple[bytes, int]':
-    """*ts* without the audio PES packets at its start whose PTS is before *limit* (their TS packets become null
-    packets). Returns (data, number of PES packets dropped)."""
+def _adts_frames(es: bytes) -> 'list | None':
+    """[(offset, length), ...] of the ADTS frames in the audio data *es*, None if it does not start with one or breaks off."""
+    frames = []
+    i = 0
+    while i + 7 <= len(es):
+        if es[i] != 0xFF or es[i + 1] & 0xF0 != 0xF0:
+            return None
+        length = ((es[i + 3] & 3) << 11) | (es[i + 4] << 3) | (es[i + 5] >> 5)
+        if length < 7 or i + length > len(es):
+            return None
+        frames.append((i, length))
+        i += length
+    return frames or None
+
+
+def _adts_frame_ticks(ts: bytes, apid: int) -> 'int | None':
+    """Ticks of one audio frame of the first AAC (ADTS) frame in the audio of *ts* (1024 samples), None for any other audio.
+    A PES packet can hold many frames (11 in the ad loops of Pluto, 235 ms): the distance between two PES packets is then no
+    frame."""
+    off = _first_audio_packet(ts, apid)
+    if off is None:
+        return None
+    afc = (ts[off + 3] >> 4) & 3
+    pl = off + 4 + (1 + ts[off + 4] if afc & 2 else 0)
+    es = pl + 9 + ts[pl + 8]
+    if es + 7 > off + 188 or ts[es] != 0xFF or ts[es + 1] & 0xF0 != 0xF0:
+        return None
+    rate = (ts[es + 2] >> 2) & 15
+    return 1024 * 90000 // _ADTS_RATES[rate] if rate < len(_ADTS_RATES) else None
+
+
+def _null_packet(buf: bytearray, off: int):
+    buf[off + 1] = 0x1F
+    buf[off + 2] = 0xFF
+    buf[off + 3] = 0x10
+    buf[off + 4:off + 188] = b'\xff' * 184
+
+
+def _put_pes(buf: bytearray, slots: list, pes: bytes, apid: int):
+    """Writes the PES packet *pes* into the TS packets at the offsets *slots* (the packets that held a longer one; the ones not
+    needed become null packets). The continuity counters are set later (_patch_continuity)."""
+    pos = 0
+    for n, off in enumerate(slots):
+        chunk = pes[pos:pos + 184]
+        pos += len(chunk)
+        if not chunk:
+            _null_packet(buf, off)
+            continue
+        buf[off + 1] = (0x40 if n == 0 else 0x00) | (apid >> 8)
+        buf[off + 2] = apid & 0xFF
+        if len(chunk) == 184:
+            buf[off + 3] = 0x10
+            buf[off + 4:off + 188] = chunk
+        else:
+            stuffing = 184 - len(chunk)          # an adaptation field of this many bytes (its length byte included) fills the packet
+            buf[off + 3] = 0x30
+            buf[off + 4] = stuffing - 1
+            if stuffing > 1:
+                buf[off + 5] = 0x00
+                buf[off + 6:off + 4 + stuffing] = b'\xff' * (stuffing - 2)
+            buf[off + 4 + stuffing:off + 188] = chunk
+
+
+def _drop_audio_frames(ts: bytes, apid: int, count: int, frame_ticks: int) -> 'tuple[bytes, int]':
+    """*ts* without the first *count* audio frames (AAC/ADTS, *frame_ticks* long) of its audio. PES packets that are dropped as a
+    whole become null packets, the one that is cut in the middle is rewritten without the frames and with its PTS moved on, so a
+    PES packet with many frames loses one frame at a time, not all of them. Returns (data, number of frames dropped)."""
     buf = bytearray(ts)
     dropped = 0
-    for off in range(0, len(buf) - 187, 188):
-        if buf[off] != 0x47 or ((buf[off + 1] & 0x1F) << 8 | buf[off + 2]) != apid:
+    pes_slots: list = []          # offsets of the TS packets of the PES packet that is being read
+    pes_data = bytearray()
+    offsets = [off for off in range(0, len(buf) - 187, 188)
+               if buf[off] == 0x47 and ((buf[off + 1] & 0x1F) << 8 | buf[off + 2]) == apid]
+    groups: list = []             # (slots, PES packet) in order of the stream; packets in front of the first start are strays
+    for off in offsets:
+        afc = (buf[off + 3] >> 4) & 3
+        pl = off + 4 + (1 + buf[off + 4] if afc & 2 else 0)
+        data = bytes(buf[pl:off + 188]) if afc & 1 else b''
+        if buf[off + 1] & 0x40 and data[:3] == b'\x00\x00\x01':
+            if pes_slots:
+                groups.append((pes_slots, bytes(pes_data)))
+            pes_slots, pes_data = [off], bytearray(data)
+        else:
+            pes_slots.append(off)
+            pes_data += data
+    if pes_slots:
+        groups.append((pes_slots, bytes(pes_data)))
+    remaining = count
+    for slots, pes in groups:
+        if remaining <= 0:
+            break
+        header_len = 9 + pes[8] if len(pes) >= 9 and pes[:3] == b'\x00\x00\x01' else 0
+        frames = _adts_frames(pes[header_len:]) if header_len and pes[7] & 0xC0 == 0x80 else None
+        if frames is None:
+            if pes[:3] == b'\x00\x00\x01':
+                return bytes(buf), dropped          # audio that is not made of ADTS frames: nothing is cut
+            for off in slots:                       # strays in front of the first PES packet: no use to anyone
+                _null_packet(buf, off)
             continue
-        if buf[off + 1] & 0x40:
-            afc = (buf[off + 3] >> 4) & 3
-            pl = off + 4 + (1 + buf[off + 4] if afc & 2 else 0)
-            if afc & 1 and pl + 14 <= off + 188 and buf[pl:pl + 3] == b'\x00\x00\x01' and buf[pl + 7] & 0x80:
-                b = buf[pl + 9:pl + 14]
-                pts = ((b[0] & 0x0E) << 29) | (b[1] << 22) | ((b[2] & 0xFE) << 14) | (b[3] << 7) | ((b[4] & 0xFE) >> 1)
-                if _signed33(pts - limit) >= 0:
-                    break
-                dropped += 1
-        buf[off + 1] = 0x1F
-        buf[off + 2] = 0xFF
-        buf[off + 3] = 0x10
-        buf[off + 4:off + 188] = b'\xff' * 184
+        if remaining >= len(frames):
+            for off in slots:
+                _null_packet(buf, off)
+            remaining -= len(frames)
+            dropped += len(frames)
+            continue
+        es = pes[header_len:][frames[remaining][0]:]
+        header = bytearray(pes[:header_len])
+        pts = (((header[9] & 0x0E) << 29) | (header[10] << 22) | ((header[11] & 0xFE) << 14) | (header[12] << 7) | ((header[13] & 0xFE) >> 1))
+        pts = (pts + remaining * frame_ticks) & _PTS_MASK
+        header[9] = 0x20 | (((pts >> 30) & 7) << 1) | 1
+        header[10] = (pts >> 22) & 0xFF
+        header[11] = (((pts >> 15) & 0x7F) << 1) | 1
+        header[12] = (pts >> 7) & 0xFF
+        header[13] = ((pts & 0x7F) << 1) | 1
+        length = len(header) - 6 + len(es)
+        header[4], header[5] = (length >> 8) & 0xFF, length & 0xFF
+        new_pes = bytes(header) + es
+        if len(new_pes) > 184 * len(slots):
+            return bytes(buf), dropped      # cannot happen (the packet only got shorter), but never write past the packets
+        _put_pes(buf, slots, new_pes, apid)
+        dropped += remaining
+        remaining = 0
     return bytes(buf), dropped
 
 
@@ -943,13 +1044,16 @@ class _MuxedChannel:
             # made in whole frames: drop the overlapping ones, add silent ones for a hole, and carry what is left
             # over into the next join, so that the error stays within half a frame instead of adding up.
             gap = _signed33(a_min + self._delta - self._a_end)   # > 0: a hole, < 0: an overlap
+            # The unit is the audio frame of the AAC data (1024 samples), not the distance of two PES packets: the ad loops of
+            # Pluto pack 11 frames into one (235 ms), and dropping one such packet cut a quarter of a second out of the sound.
+            a_frame = _adts_frame_ticks(out, apid) or a_frame
             k = int(round(-(gap + self._a_carry) / a_frame))     # audio frames to drop (k > 0) or to add (k < 0)
             added = dropped = 0
             if abs(k) > _AUDIO_FILL_MAX:
                 self._a_carry = 0
             else:
                 if k > 0:
-                    out, dropped = _drop_early_audio(out, apid, a_min + self._delta + k * a_frame - a_frame // 2)
+                    out, dropped = _drop_audio_frames(out, apid, k, a_frame)
                 elif k < 0:
                     try:
                         filled = _insert_silence(out, apid, self._a_end, a_frame, -k)
