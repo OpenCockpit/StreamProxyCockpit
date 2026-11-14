@@ -6,12 +6,12 @@ Local stream proxy for the Open-Enigma2 plugins that provide FAST-channel stream
 - Keeps ad breaks from disturbing playback and recordings
 - Records a channel from one continuous stream, shared by all recordings and timeshifts of the channel
 - Looks up the address of a channel when it is played, and renews it when it expires
+- Supports HLS only
 
 ## Used by
 - PlutoTVCockpit
 - RakutenTVCockpit
 - SamsungTVCockpit
-
 ## Disclaimer
 The project author is not responsible for how this software is used by others. It is not intended to be used for accessing or distributing copyrighted materials without authorization.
 Users are solely responsible for determining the legality of their actions.
