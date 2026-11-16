@@ -1,4 +1,4 @@
-# Copyright (C) 2026 by xcentaurix
+# Copyright (C) 2018-2026 by xcentaurix
 # License: GNU General Public License v3.0
 #
 #   StreamProxy - the integration of the stream proxy (LiveProxyUnmuxed, RecordingProxyUnmuxed, ...) with Enigma2 for the
