@@ -136,7 +136,7 @@ def remap_pids(ts: bytes, source: 'tuple | None', target: 'tuple | None', video_
         if ts[off] != _SYNC:
             return None
         pid = ((ts[off + 1] & 0x1F) << 8) | ts[off + 2]
-        if pid == _PAT_PID or pid == s_pmt:
+        if pid in (_PAT_PID, s_pmt):
             if ts[off + 1] & 0x40:   # a section starts: the whole PAT/PMT of the target takes its place
                 packet = bytearray(pat_packet if pid == _PAT_PID else pmt_packet)
                 packet[3] = (packet[3] & 0xF0) | (ts[off + 3] & 0x0F)

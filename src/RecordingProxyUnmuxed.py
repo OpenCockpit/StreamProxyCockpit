@@ -123,6 +123,41 @@ def _segment_is_disc(data: bytes) -> bool:
     return False
 
 
+def _video_span(data: bytes) -> 'tuple[int, int] | None':
+    """(start, end) PTS in 90 kHz ticks of the video frames in raw MPEG-TS *data*: the earliest frame to show, and where the
+    last one ends (its PTS plus one frame interval). None if *data* holds no video PTS.
+
+    The real length of a segment, which is not always the nominal one: the last segment of a content before an ad break is
+    a short one (1.7 s of 5 s). The frame interval is the most common gap between the sorted PTS values, which stays right
+    when B-frames make the PTS arrive out of order."""
+    base = None
+    values = set()
+    for off in range(0, len(data) - 187, 188):
+        if data[off] != 0x47 or not (data[off + 1] & 0x40):                    # sync byte, payload unit start
+            continue
+        afc = (data[off + 3] >> 4) & 3
+        if not afc & 1:                                                         # no payload
+            continue
+        pl = off + 4 + (1 + data[off + 4] if afc & 2 else 0)
+        if pl + 14 > off + 188 or data[pl:pl + 3] != b'\x00\x00\x01' or not 0xE0 <= data[pl + 3] <= 0xEF:
+            continue
+        if not data[pl + 7] & 0x80:                                             # no PTS
+            continue
+        b = data[pl + 9:pl + 14]
+        pts = ((b[0] & 0x0E) << 29) | (b[1] << 22) | ((b[2] & 0xFE) << 14) | (b[3] << 7) | ((b[4] & 0xFE) >> 1)
+        if base is None:
+            base = pts
+        values.add(((pts - base + (1 << 32)) & _PTS_MASK) - (1 << 32))          # relative to the first, so a wrap does no harm
+    if base is None:
+        return None
+    ordered = sorted(values)
+    gaps: dict = {}
+    for a, b in zip(ordered, ordered[1:]):
+        gaps[b - a] = gaps.get(b - a, 0) + 1
+    interval = max(gaps, key=gaps.get) if gaps else 0
+    return (base + ordered[0]) & _PTS_MASK, (base + ordered[-1] + interval) & _PTS_MASK
+
+
 def _rewrite_timeline(data: bytes, delta: int) -> bytes:
     """Shift every PCR/PTS/DTS field in *data* by *delta* (90kHz ticks).
 
@@ -222,10 +257,17 @@ class RecordingSession:
         first_pts = _first_pts(muxed)
         if first_pts is None:
             return muxed
+        # The segment's own video span, not the nominal segment length: the last segment before an ad break is short (1.7 s
+        # of 5 s), and expecting the next one a whole nominal length later left a 3.3 s hole in the recording there.
+        span = _video_span(muxed)
+        if span is not None and not 0 < (span[1] - span[0]) & _PTS_MASK <= self._seg_ticks * 3:
+            span = None                      # not a length a segment can have: fall back to the nominal one
+        start = span[0] if span is not None else first_pts
         if _segment_is_disc(muxed) and self._expected_next_pts is not None:
-            self._pts_delta = self._expected_next_pts - first_pts
+            self._pts_delta = self._expected_next_pts - start
         out = _rewrite_timeline(muxed, self._pts_delta)
-        self._expected_next_pts = (first_pts + self._pts_delta + self._seg_ticks) & _PTS_MASK
+        end = span[1] if span is not None else start + self._seg_ticks
+        self._expected_next_pts = (end + self._pts_delta) & _PTS_MASK
         return out
 
     def _enqueue(self, chunk):

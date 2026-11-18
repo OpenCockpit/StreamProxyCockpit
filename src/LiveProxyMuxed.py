@@ -572,8 +572,9 @@ def _drop_audio_frames(ts: bytes, apid: int, count: int, frame_ticks: int) -> 't
         if remaining <= 0:
             break
         header_len = 9 + pes[8] if len(pes) >= 9 and pes[:3] == b'\x00\x00\x01' else 0
-        frames = _adts_frames(pes[header_len:]) if header_len and pes[7] & 0xC0 == 0x80 else None
-        if frames is None:
+        # _adts_frames gives None, never an empty list, for audio that is not made of ADTS frames: "no frames" is both here
+        frames = (_adts_frames(pes[header_len:]) if header_len and pes[7] & 0xC0 == 0x80 else None) or []
+        if not frames:
             if pes[:3] == b'\x00\x00\x01':
                 return bytes(buf), dropped          # audio that is not made of ADTS frames: nothing is cut
             for off in slots:                       # strays in front of the first PES packet: no use to anyone
