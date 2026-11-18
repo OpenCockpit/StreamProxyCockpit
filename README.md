@@ -23,6 +23,3 @@ This repository has no control over the streams, links, or the legality of the c
 
 ## Installation
 The plugin will be installed as a dependency, no explicit installation required.
-
-## Wiki
-- https://github.com/OpenCockpit/StreamProxyCockpit/wiki
