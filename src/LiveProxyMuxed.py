@@ -56,6 +56,8 @@ _HOLD_WINDOW = 2.0             # ... for this many seconds after a player (re)st
 _SESSION_GAP = 20.0            # a playlist request after this long without one starts a new playback session
 _PLAYLIST_SEGMENTS = 6         # segments advertised in the served playlist at least
 _MIN_TARGET = 3                # the shortest target duration advertised: hlsdemux starts three of them before the end
+_PLAYER_CUSHION_SEGMENTS = 3   # hlsdemux starts this many segments before the end of the playlist, and keeps that distance while it plays
+_PLAYER_ACTIVE = 15.0          # a playlist asked for this recently: a player is watching the channel
 _MAX_READY = 40                # segments kept per channel; a reader further behind is moved forward
 _IDLE_TIMEOUT = 60.0           # seconds without a request or reader before the poller stops
 _STALL_LIMIT = 90.0            # seconds without a new segment before the poller gives up
@@ -654,6 +656,7 @@ class _MuxedChannel:
         self._normalize_all = False    # a segment had no readable PAT/PMT: remux every one from then on
         self._remapped_from = None     # the layout that was last logged as given the PIDs of the first one
         self._last_playlist = -math.inf               # when a playlist was last asked for
+        self._offered_end = None                      # (last segment of the playlist that was offered last, when)
         self._hold_until = 0.0                        # until when the newest segments are held back from it
         self._start_target = 1                        # segments in the ring before the channel counts as ready
         self._created = time.monotonic()
@@ -728,6 +731,28 @@ class _MuxedChannel:
         with self.cond:
             return next(reversed(self.ready)) if self.ready else None
 
+    def player_seq(self) -> 'int | None':
+        """The segment the picture of the live player is at, as far as the player is concerned: it starts _PLAYER_CUSHION_SEGMENTS
+        before the end of the playlist it was given, and keeps that distance as it plays. A recording that starts there has
+        what is on the screen: one from the newest segment starts 15 to 30 s after it (the playlist is held back from a starting
+        player, and the player has its cushion), which is why a timeshift of a stream paused the picture that late. A channel
+        nobody is watching gets the segment a player would start with now."""
+        with self.cond:
+            ready = list(self.ready.items())
+            offered = self._offered_end
+        if not ready:
+            return None
+        if offered is not None and time.monotonic() - offered[1] < _PLAYER_ACTIVE:
+            end = offered[0]
+        else:
+            hold = min(_hold_count([duration for _seq, (_data, duration) in ready]), max(0, len(ready) - self._start_target))
+            end = ready[len(ready) - 1 - hold][0]
+        first = end - _PLAYER_CUSHION_SEGMENTS
+        for seq, _item in ready:
+            if seq >= first:
+                return seq
+        return ready[-1][0]
+
     def playlist(self) -> 'str | None':
         """The media playlist for live playback: the newest segments (not all of them to a starting player)."""
         with self.cond:
@@ -761,6 +786,8 @@ class _MuxedChannel:
             first -= 1
             total += ready[first][1][1]
         items = ready[first:]
+        with self.cond:
+            self._offered_end = (items[-1][0], now)
         target = max(target, math.ceil(max(duration for _seq, (_data, duration) in items)) - 1)
         out = ['#EXTM3U', '#EXT-X-VERSION:3', f'#EXT-X-TARGETDURATION:{target}', f'#EXT-X-MEDIA-SEQUENCE:{items[0][0]}']
         for seq, (_data, duration) in items:

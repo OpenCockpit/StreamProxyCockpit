@@ -48,8 +48,11 @@ def _reopen(channel, state, failures):
 
 
 def _segments(channel, state):
-    """Yield the channel's segments in order, starting with the newest one (the live edge)."""
+    """Yield the channel's segments in order, starting with the one the live player is at (LiveProxyMuxed.player_seq): the
+    recording has what is on the screen when it starts, not what comes 15 to 30 s later. A timeshift needs that: its position
+    for "now" is the time since its start. After a restart of the poller it goes on with the newest one."""
     seq = None
+    first = True
     failures = 0   # restarts of the poller in a row that brought no segment
     while True:
         # the idle reaper of LiveProxyUnmuxed forgets a channel nobody asks for: a recording keeps it (and the poller) alive
@@ -57,9 +60,11 @@ def _segments(channel, state):
         channel.touch()
         item = None
         if seq is None:
-            newest = channel.newest_seq()
+            newest = channel.player_seq() if first else channel.newest_seq()
             if newest is not None:
                 seq = newest
+                first = False
+                logger.debug('%s: the recording starts with segment %s (the newest is %s)', channel.channel_id, seq, channel.newest_seq())
             elif not channel.closed:
                 time.sleep(0.1)
                 continue
