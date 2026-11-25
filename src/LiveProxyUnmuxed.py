@@ -3536,7 +3536,7 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
         /seg/{channel_id}/{seq}.ts      – TS segment (merged)
     """
 
-    def log_message(self, format, *args):  # pylint: disable=redefined-builtin  # noqa: A002
+    def log_message(self, format, *args):
         pass   # silence the default per-request log lines
 
     def do_GET(self):
